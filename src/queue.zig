@@ -1,5 +1,6 @@
 const std = @import("std");
 const assert = @import("util.zig").assert;
+const builtin = @import("builtin");
 
 /// An intrusive queue implementation. The type T must have a field
 /// "next" and prev of type `?*T` which is an enum with a value matching the passed in
@@ -71,7 +72,7 @@ pub fn Intrusive(
         }
 
         /// Returns true if the queue is empty.
-        pub fn empty(self: Self) bool {
+        pub fn empty(self: *const Self) bool {
             return self.head == null;
         }
 
@@ -172,7 +173,7 @@ pub fn DoublyLinkedListType(
         tail: ?*Node = null,
         count: u32 = 0,
 
-        fn contains(list: *const DoublyLinkedList, target: *const Node) bool {
+        pub fn contains(list: *const DoublyLinkedList, target: *const Node) bool {
             var count: u32 = 0;
 
             var iterator = list.tail;
@@ -185,6 +186,8 @@ pub fn DoublyLinkedListType(
             assert(count == list.count);
             return false;
         }
+
+        pub const hasItem = contains;
 
         pub inline fn getTail(list: *const DoublyLinkedList) ?*Node {
             if (list.tail) |tail| {
@@ -290,6 +293,7 @@ const QueueLink = extern struct {
     next: ?*QueueLink = null,
 };
 
+//  FIFO
 /// An intrusive first in/first out linked list.
 /// The element type T must have a field called "link" of type QueueType(T).Link.
 pub fn QueueType(comptime T: type) type {
@@ -446,3 +450,215 @@ const QueueAny = struct {
         }
     };
 };
+
+/// A single intrusive link node used by IntrusiveLifo.
+///
+/// This link is embedded *inside* the user type `T`.
+/// The LIFO itself never allocates memory and never owns elements:
+/// it only rewires these `next` pointers.
+///
+/// Invariants:
+/// - `next == null` means the node is not currently in any LIFO
+/// - a node MUST NOT be pushed twice without being popped
+///
+/// Layout:
+///     T
+///     ├─ user fields...
+///     └─ link: IntrusiveLifoLink
+///            └─ next ──► next element's link
+///
+pub const IntrusiveLifoLink = extern struct {
+    next: ?*IntrusiveLifoLink = null,
+};
+
+///// An intrusive last-in / first-out stack (LIFO).
+///
+/// Characteristics:
+/// - O(1) push
+/// - O(1) pop
+/// - O(1) peek
+/// - O(n) contains
+/// - zero allocations
+/// - stable memory addresses
+///
+/// The element type `T` MUST embed a field:
+///
+///     link: IntrusiveLifo(T).Link
+///
+/// Example:
+///
+///     const Item = struct {
+///         value: u32,
+///         link: IntrusiveLifo(Item).Link = .{},
+///     };
+///
+/// Memory ownership:
+/// - The stack does NOT own elements
+/// - Caller is responsible for element lifetime
+///
+/// Thread-safety:
+/// - NOT thread-safe
+/// - External synchronization required if used concurrently
+pub fn IntrusiveLifo(comptime T: type) type {
+    return struct {
+        any: IntrusiveLifoAny,
+
+        pub const Link = IntrusiveLifoLink;
+        const Self = @This();
+
+        pub inline fn init() Self {
+            return .{ .any = .{} };
+        }
+
+        pub inline fn count(self: *Self) u64 {
+            return self.any.count;
+        }
+
+        /// Pushes a new node to the first position of the Stack.
+        pub inline fn push(self: *Self, node: *T) void {
+            self.any.push(&node.link);
+        }
+
+        /// Returns the first element of the Stack list, and removes it.
+        pub inline fn pop(self: *Self) ?*T {
+            const link = self.any.pop() orelse return null;
+            return @alignCast(@fieldParentPtr("link", link));
+        }
+
+        /// Returns the first element of the Stack list, but does not remove it.
+        pub inline fn peek(self: *const Self) ?*T {
+            const link = self.any.peek() orelse return null;
+            return @alignCast(@fieldParentPtr("link", link));
+        }
+
+        /// Checks if the Stack is empty.
+        pub inline fn empty(self: *const Self) bool {
+            return self.any.empty();
+        }
+
+        /// Returns whether the linked list contains the given *exact element* (pointer comparison).
+        pub inline fn contains(self: *const Self, needle: *const T) bool {
+            return self.any.contains(&needle.link);
+        }
+    };
+}
+
+/// Non-generic intrusive LIFO implementation.
+///
+/// This struct operates purely on IntrusiveLifoLink nodes.
+/// It knows nothing about the containing type `T`.
+///
+/// Data layout:
+///
+///     head ──► [link] ──► [link] ──► [link] ──► null
+///               ▲
+///               │
+///             top of stack
+///
+///Before push:
+//     head
+//      │
+//      ▼
+//    [ A ] ──► [ B ] ──► null
+//
+// Push C:
+//
+//     C.next = head
+//     head   = C
+//
+// After push:
+//
+//     head
+//      │
+//      ▼
+//    [ C ] ──► [ A ] ──► [ B ] ──► null
+//
+//
+// Pop:
+//
+//     result = head  (C)
+//     head   = C.next (A)
+//     C.next = null
+//     pop() → C
+// head → A → B → null
+const IntrusiveLifoAny = struct {
+    head: ?*IntrusiveLifoLink = null,
+
+    count: u64 = 0,
+    const Self = @This();
+
+    inline fn push(self: *Self, link: *IntrusiveLifoLink) void {
+        assert((self.count == 0) == (self.head == null));
+        assert(link.next == null);
+
+        // Insert the new element at the head.
+        link.next = self.head;
+        self.head = link;
+        self.count += 1;
+    }
+
+    inline fn pop(self: *Self) ?*IntrusiveLifoLink {
+        assert((self.count == 0) == (self.head == null));
+
+        const link = self.head orelse return null;
+        self.head = link.next;
+        link.next = null;
+        self.count -= 1;
+        return link;
+    }
+
+    inline fn peek(self: *const Self) ?*IntrusiveLifoLink {
+        return self.head;
+    }
+
+    inline fn empty(self: *const Self) bool {
+        assert((self.count == 0) == (self.head == null));
+        return self.head == null;
+    }
+
+    inline fn contains(self: *const Self, needle: *const IntrusiveLifoLink) bool {
+        var next = self.head;
+        for (0..self.count + 1) |_| {
+            const link = next orelse return false;
+            if (link == needle) return true;
+            next = link.next;
+        } else unreachable;
+    }
+};
+
+test "Stack: push/pop/peek/empty" {
+    const testing = @import("std").testing;
+    const Item = struct { link: IntrusiveLifoLink = .{} };
+
+    var one: Item = .{};
+    var two: Item = .{};
+    var three: Item = .{};
+
+    var stack: IntrusiveLifo(Item) = IntrusiveLifo(Item).init();
+
+    try testing.expect(stack.empty());
+
+    // Push one element and verify
+    stack.push(&one);
+    try testing.expect(!stack.empty());
+    try testing.expectEqual(@as(?*Item, &one), stack.peek());
+    try testing.expect(stack.contains(&one));
+    try testing.expect(!stack.contains(&two));
+    try testing.expect(!stack.contains(&three));
+
+    // Push two more elements
+    stack.push(&two);
+    stack.push(&three);
+    try testing.expect(!stack.empty());
+    try testing.expectEqual(@as(?*Item, &three), stack.peek());
+    try testing.expect(stack.contains(&one));
+    try testing.expect(stack.contains(&two));
+    try testing.expect(stack.contains(&three));
+
+    // Pop elements and check Stack order
+    try testing.expectEqual(@as(?*Item, &three), stack.pop());
+    try testing.expectEqual(@as(?*Item, &two), stack.pop());
+    try testing.expectEqual(@as(?*Item, &one), stack.pop());
+    try testing.expect(stack.empty());
+    try testing.expectEqual(@as(?*Item, null), stack.pop());
+}
