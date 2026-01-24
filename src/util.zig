@@ -8,23 +8,30 @@ pub const assert = switch (builtin.mode) {
 
     .ReleaseSmall, .ReleaseFast => (struct {
         inline fn assert(ok: bool) void {
-            if (!ok) unreachable;
+            if (!ok) {
+                @branchHint(.cold);
+                unreachable;
+            }
         }
     }).assert,
 };
 
 pub inline fn clamp(comptime T: type, sz: T, min: T, max: T) T {
-    if (sz < min) {
-        return min;
-    } else if (sz > max) {
-        return max;
-    } else sz;
+    return @max(min, @min(sz, max));
 }
 
 // Align a byte size to a size in _machine words_
 pub inline fn wsizeCount(size: usize) usize {
     assert(size <= types.SIZE_MAX - @sizeOf(usize));
     return (size + @sizeOf(usize) - 1) / @sizeOf(usize);
+}
+
+pub inline fn zeroed(bytes: []const u8) bool {
+    var byte_bits: u8 = 0;
+    for (bytes) |byte| {
+        byte_bits |= byte;
+    }
+    return byte_bits == 0;
 }
 
 // Is memory zero initialized?
@@ -53,9 +60,16 @@ pub inline fn memIsZero(comptime T: type, buf: []const T) bool {
         }
         return true;
     } else {
-        @branchHint(.unlikely);
+        @branchHint(.cold);
         return allEqual(T, buf, 0);
     }
+}
+
+inline fn bsr(x: usize) usize {
+    return if (x == 0)
+        types.INTPTR_BITS
+    else
+        types.INTPTR_BITS - 1 - @clz(x);
 }
 
 inline fn allEqual(comptime T: type, slice: []const T, scalar: T) bool {
@@ -139,14 +153,15 @@ test "memIsZero:u32 agrees with manual check" {
     }
 }
 
-test "bench memIsZero vs allEqual" {
-    // var buf = [_]u8{0} ** 4096;
-    var buf = [_]u8{0} ** 1024;
+test "bench memIsZero vs allEqual vs zeroed" {
+    var buf = [_]u8{0} ** 4096;
+    // var buf = [_]u8{0} ** 1024;
 
     const slice = buf[0..];
 
     _ = memIsZero(u8, slice);
     _ = std.mem.allEqual(u8, slice, 0);
+    _ = zeroed(slice);
 
     const iters = 500;
 
@@ -172,20 +187,80 @@ test "bench memIsZero vs allEqual" {
         }.f,
     );
 
-    try testing.expect(t1 > 0 and t2 > 0);
+    const t3 = try bench(
+        "zeroed",
+        iters,
+        slice,
+        struct {
+            fn f(b: []const u8) bool {
+                return zeroed(b);
+            }
+        }.f,
+    );
+
+    try testing.expect(t1 > 0 and t2 > 0 and t3 > 0);
 }
 
 /// Round an address up to the next (or current) aligned address.
 /// The alignment must be a power of 2 and greater than 0.
 /// Asserts that rounding up the address does not cause integer overflow.
-pub fn alignForward(comptime T: type, addr: T, alignment: T) T {
+pub inline fn alignForward(comptime T: type, addr: T, alignment: T) T {
     assert(isValidAlignGeneric(T, alignment));
     return alignBackward(T, addr + (alignment - 1), alignment);
 }
 
+/// Alias for alignForward
+pub inline fn alignUp(addr: usize, alignment: usize) usize {
+    return alignForward(usize, addr, alignment);
+}
+
+/// Aligns a given pointer value to a specified alignment factor.
+/// Returns an aligned pointer or null if one of the following conditions is
+/// met:
+/// - The aligned pointer would not fit the address space,
+/// - The delta required to align the pointer is not a multiple of the pointee's
+///   type.
+pub inline fn alignPointer(ptr: anytype, align_to: usize) ?@TypeOf(ptr) {
+    const adjust_off = alignPointerOffset(ptr, align_to) orelse return null;
+    // Avoid the use of ptrFromInt to avoid losing the pointer provenance info.
+    return @alignCast(ptr + adjust_off);
+}
+
+/// Returns whether `alignment` is a valid alignment, meaning it is
+/// a positive power of 2.
+pub inline fn isValidAlign(alignment: usize) bool {
+    return isValidAlignGeneric(usize, alignment);
+}
+
+pub inline fn alignPointerOffset(ptr: anytype, align_to: usize) ?usize {
+    assert(isValidAlign(align_to));
+
+    const T = @TypeOf(ptr);
+    const info = @typeInfo(T);
+    if (info != .pointer or info.pointer.size != .many)
+        @compileError("expected many item pointer, got " ++ @typeName(T));
+
+    // Do nothing if the pointer is already well-aligned.
+    if (align_to <= info.pointer.alignment)
+        return 0;
+
+    // Calculate the aligned base address with an eye out for overflow.
+    const addr = @intFromPtr(ptr);
+    var ov = @addWithOverflow(addr, align_to - 1);
+    if (ov[1] != 0) return null;
+    ov[0] &= ~@as(usize, align_to - 1);
+
+    // The delta is expressed in terms of bytes, turn it into a number of child
+    // type elements.
+    const delta = ov[0] - addr;
+    const pointee_size = @sizeOf(info.pointer.child);
+    if (delta % pointee_size != 0) return null;
+    return delta / pointee_size;
+}
+
 /// Round an address down to the previous (or current) aligned address.
 /// The alignment must be a power of 2 and greater than 0.
-pub fn alignBackward(comptime T: type, addr: T, alignment: T) T {
+pub inline fn alignBackward(comptime T: type, addr: T, alignment: T) T {
     assert(isValidAlignGeneric(T, alignment));
     // 000010000 // example alignment
     // 000001111 // subtract 1
