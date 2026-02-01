@@ -38,7 +38,7 @@ pub inline fn map(self: *const OsAllocator, n: usize, alignment: mem.Alignment) 
     const overalloc_len = if (max_drop_len <= aligned_len - n)
         aligned_len
     else
-        mem.alignForward(usize, aligned_len + max_drop_len, page_size);
+        utils.alignForward(usize, aligned_len + max_drop_len, page_size);
     const hint = @atomicLoad(@TypeOf(std.heap.next_mmap_addr_hint), &std.heap.next_mmap_addr_hint, .unordered);
 
     const slice = posix.mmap(
@@ -82,17 +82,17 @@ fn alloc(context: *anyopaque, n: usize, alignment: mem.Alignment, ra: usize) ?[*
 }
 
 fn resize(context: *anyopaque, memory: []u8, alignment: mem.Alignment, new_len: usize, return_address: usize) bool {
-    _ = context;
     _ = alignment;
     _ = return_address;
-    return realloc(memory, new_len, false) != null;
+    const self: *OsAllocator = @ptrCast(@alignCast(context));
+    return self.realloc(memory, new_len, false) != null;
 }
 
 fn remap(context: *anyopaque, memory: []u8, alignment: mem.Alignment, new_len: usize, return_address: usize) ?[*]u8 {
-    _ = context;
     _ = alignment;
     _ = return_address;
-    return realloc(memory, new_len, true);
+    const self: *OsAllocator = @ptrCast(@alignCast(context));
+    return self.realloc(memory, new_len, true);
 }
 
 fn free(context: *anyopaque, memory: []u8, alignment: mem.Alignment, return_address: usize) void {

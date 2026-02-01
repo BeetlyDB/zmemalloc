@@ -5,6 +5,7 @@ const mem = std.mem;
 const Allocator = mem.Allocator;
 const os_alloc = @import("os_allocator.zig");
 const os = @import("os.zig");
+const utils = @import("util.zig");
 
 /// Thread-safe internal allocator for zmemalloc metadata structures.
 /// Uses a static buffer with lock-free atomic operations to avoid OS calls,
@@ -19,10 +20,9 @@ pub fn InternalAllocator(comptime size: usize, comptime config: os.OsMemConfig) 
         /// Current allocation end index in static buffer
         end_index: usize align(std.atomic.cache_line) = 0,
 
-        /// OS allocator for fallback (mmap/munmap are inherently thread-safe)
+        /// OS allocator for fallback
         os_allocator: os_alloc.OsAllocator = .{ .config = config },
 
-        /// Returns a thread-safe Allocator interface.
         pub fn get(self: *Self) Allocator {
             return .{
                 .ptr = self,
@@ -82,7 +82,7 @@ pub fn InternalAllocator(comptime size: usize, comptime config: os.OsMemConfig) 
             var end_index = @atomicLoad(usize, &self.end_index, .acquire);
 
             while (true) {
-                const adjust_off = mem.alignPointerOffset(self.buffer[0..].ptr + end_index, ptr_align) orelse {
+                const adjust_off = utils.alignPointerOffset(self.buffer[0..].ptr + end_index, ptr_align) orelse {
                     // Alignment overflow, fall back to OS
                     return self.os_allocator.map(n, alignment);
                 };
@@ -252,10 +252,6 @@ pub fn InternalAllocator(comptime size: usize, comptime config: os.OsMemConfig) 
             }
         }
 
-        // -------------------------------------------------------------------------
-        // Helper functions
-        // -------------------------------------------------------------------------
-
         inline fn sliceContainsPtr(container: []u8, ptr: [*]u8) bool {
             return @intFromPtr(ptr) >= @intFromPtr(container.ptr) and
                 @intFromPtr(ptr) < (@intFromPtr(container.ptr) + container.len);
@@ -270,7 +266,7 @@ pub fn InternalAllocator(comptime size: usize, comptime config: os.OsMemConfig) 
 
 /// Default internal allocator type with 4KiB static buffer
 pub const DefaultInternalAllocator = InternalAllocator(
-    (types.INTPTR_SIZE / 2) * types.KiB, // 4KiB on 64-bit
+    256 * types.KiB,
     os.mem_config_static,
 );
 

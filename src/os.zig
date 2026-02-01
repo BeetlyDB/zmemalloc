@@ -24,7 +24,7 @@ pub const OsMemConfig = struct {
     has_overcommit: bool = true,
     has_partial_free: bool = true,
     has_virtual_reserve: bool = true,
-    thp: ThpMode = .thp_mode_default,
+    thp: ThpMode = .thp_mode_always,
     has_numa_available: bool = false,
     numa_nodes: usize = 1,
 
@@ -33,7 +33,7 @@ pub const OsMemConfig = struct {
         thp_mode_always, // Always set MADV_HUGEPAGE. */
     };
 
-    pub inline fn init(cfg: *Self) void {
+    pub inline fn init(cfg: *Self) void { //TODO: make init in comptime and get in static
         cfg.page_size = std.heap.pageSize();
         cfg.allocation_granularity = cfg.page_size;
 
@@ -65,6 +65,7 @@ pub inline fn maybe_enable_thp(
     alignment_bytes: usize,
     mode: OsMemConfig.ThpMode,
 ) void {
+    if (len < 8 * 1024 * 1024) return;
     if (mode == .thp_mode_always and (builtin.mode == .ReleaseSafe or builtin.mode == .Debug)) {
         const huge = mem_config_static.large_page_size;
 
@@ -109,9 +110,9 @@ pub inline fn prim_decommit(mem: []align(mem_config_static.page_size) u8, needs_
     try posix.madvise(mem.ptr, mem.len, posix.MADV.DONTNEED);
 }
 
-pub inline fn prim_protect(mem: []align(mem_config_static.page_size) u8, protect: bool) !void {
+pub inline fn prim_protect(mem: []align(mem_config_static.page_size) u8, do_protect: bool) !void {
     if (mem.len == 0) return;
-    const prot = if (protect) posix.PROT.NONE else (posix.PROT.READ | posix.PROT.WRITE);
+    const prot = if (do_protect) posix.PROT.NONE else (posix.PROT.READ | posix.PROT.WRITE);
 
     try posix.mprotect(mem, prot);
 }
@@ -438,4 +439,94 @@ test "OsMemConfig init sets defaults correctly" {
     try testing.expect(cfg.virtual_address_bits == DEFAULT_VIRTUAL_ADDRESS);
     try testing.expect(cfg.has_partial_free);
     try testing.expect(cfg.has_virtual_reserve);
+}
+
+pub inline fn pageSize() usize {
+    return mem_config_static.page_size;
+}
+
+/// Commit memory (make it accessible)
+pub fn commitEx(mem: []u8, is_zero: *bool) bool {
+    is_zero.* = false;
+    if (mem.len == 0) return true;
+
+    var csize: usize = undefined;
+    const start = page_align_area(false, mem.ptr, mem.len, &csize) orelse return true;
+    if (csize == 0) return true;
+
+    var os_zero: bool = false;
+    prim_commit(start[0..csize], &os_zero) catch return false;
+    return true;
+}
+
+/// Commit memory
+pub fn commit(ptr: [*]u8, size: usize) bool {
+    if (size == 0) return true;
+
+    var csize: usize = undefined;
+    const start = page_align_area(false, ptr, size, &csize) orelse return true;
+    if (csize == 0) return true;
+
+    var os_zero: bool = false;
+    const aligned_start: [*]align(mem_config_static.page_size) u8 = @alignCast(start);
+    prim_commit(aligned_start[0..csize], &os_zero) catch return false;
+
+    stats.main_stats.addCount(.committed, @intCast(csize));
+    return true;
+}
+
+/// Purge memory (advise kernel it's not needed, may be decommitted)
+pub fn purge(mem: []u8) bool {
+    if (mem.len == 0) return false;
+
+    var csize: usize = undefined;
+    const start = page_align_area(true, mem.ptr, mem.len, &csize) orelse return false;
+    if (csize == 0) return false;
+
+    var needs_recommit: bool = false;
+    prim_decommit(start[0..csize], &needs_recommit) catch return false;
+    return needs_recommit;
+}
+
+/// Protect memory (make it inaccessible)
+pub fn protect(mem: []u8) !void {
+    if (mem.len == 0) return;
+
+    var csize: usize = undefined;
+    const start = page_align_area(false, mem.ptr, mem.len, &csize) orelse return;
+    if (csize == 0) return;
+
+    try prim_protect(start[0..csize], true);
+}
+
+/// Unprotect memory (make it accessible again)
+pub fn unprotect(mem: []u8) !void {
+    if (mem.len == 0) return;
+
+    var csize: usize = undefined;
+    const start = page_align_area(false, mem.ptr, mem.len, &csize) orelse return;
+    if (csize == 0) return;
+
+    try prim_protect(start[0..csize], false);
+}
+
+/// Decommit memory (make it not backed by physical memory)
+pub fn decommit(ptr: [*]u8, size: usize) bool {
+    if (size == 0) return true;
+
+    var csize: usize = undefined;
+    const start = page_align_area(true, ptr, size, &csize) orelse return true;
+    if (csize == 0) return true;
+
+    var needs_recommit: bool = false;
+    prim_decommit(start[0..csize], &needs_recommit) catch return false;
+
+    stats.main_stats.subCount(.committed, @intCast(csize));
+    return true;
+}
+
+/// Check if large pages (huge pages) are supported on this system
+pub fn supportsLargePages() bool {
+    // On Linux, check if huge pages are available
+    return mem_config_static.large_page_size > mem_config_static.page_size;
 }

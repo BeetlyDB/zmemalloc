@@ -173,7 +173,7 @@ pub fn DoublyLinkedListType(
         tail: ?*Node = null,
         count: u32 = 0,
 
-        pub fn contains(list: *const DoublyLinkedList, target: *const Node) bool {
+        pub inline fn contains(list: *const DoublyLinkedList, target: *const Node) bool {
             var count: u32 = 0;
 
             var iterator = list.tail;
@@ -199,12 +199,12 @@ pub fn DoublyLinkedListType(
             }
         }
 
-        pub fn empty(list: *const DoublyLinkedList) bool {
+        pub inline fn empty(list: *const DoublyLinkedList) bool {
             assert((list.count == 0) == (list.tail == null));
             return list.count == 0;
         }
 
-        pub fn push(list: *DoublyLinkedList, node: *Node) void {
+        pub inline fn push(list: *DoublyLinkedList, node: *Node) void {
             assert(@field(node, field_back) == null);
             assert(@field(node, field_next) == null);
 
@@ -222,7 +222,7 @@ pub fn DoublyLinkedListType(
             list.count += 1;
         }
 
-        pub fn pop(list: *DoublyLinkedList) ?*Node {
+        pub inline fn pop(list: *DoublyLinkedList) ?*Node {
             if (list.tail) |tail_old| {
                 assert(list.count > 0);
                 assert(@field(tail_old, field_next) == null);
@@ -243,7 +243,7 @@ pub fn DoublyLinkedListType(
             }
         }
 
-        pub fn remove(list: *DoublyLinkedList, node: *Node) void {
+        pub inline fn remove(list: *DoublyLinkedList, node: *Node) void {
             assert(list.count > 0);
             assert(list.tail != null);
 
@@ -265,7 +265,6 @@ pub fn DoublyLinkedListType(
             @field(node, field_back) = null;
             @field(node, field_next) = null;
             list.count -= 1;
-
             assert((list.count == 0) == (list.tail == null));
         }
     };

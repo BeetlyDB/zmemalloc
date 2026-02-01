@@ -65,13 +65,6 @@ pub inline fn memIsZero(comptime T: type, buf: []const T) bool {
     }
 }
 
-inline fn bsr(x: usize) usize {
-    return if (x == 0)
-        types.INTPTR_BITS
-    else
-        types.INTPTR_BITS - 1 - @clz(x);
-}
-
 inline fn allEqual(comptime T: type, slice: []const T, scalar: T) bool {
     for (slice) |item| {
         if (item != scalar) return false;
@@ -291,4 +284,10 @@ pub fn isValidAlignGeneric(comptime T: type, alignment: T) bool {
 pub inline fn isPowerOfTwo(int: anytype) bool {
     assert(int > 0);
     return (int & (int - 1)) == 0;
+}
+
+/// Divide and round up (ceiling division)
+pub inline fn divCeil(numerator: usize, denominator: usize) usize {
+    assert(denominator > 0);
+    return (numerator + denominator - 1) / denominator;
 }
