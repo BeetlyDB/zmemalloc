@@ -8,6 +8,7 @@ const Stats = @import("stats.zig").Stats;
 const OsAllocator = @import("os_allocator.zig");
 const arena_mod = @import("arena.zig");
 const util = @import("util.zig");
+const os_mod = @import("os.zig");
 const assert = util.assert;
 
 const Atomic = std.atomic.Value;
@@ -167,7 +168,7 @@ pub const Segment = struct {
 
         // Use madvise to purge
         const ptr: [*]align(std.heap.page_size_min) u8 = @alignCast(start);
-        std.posix.madvise(ptr, psize, std.posix.MADV.DONTNEED) catch {};
+        std.posix.madvise(ptr, psize, std.posix.MADV.FREE) catch {};
         pg.flags.is_commited = false;
     }
 
@@ -632,8 +633,20 @@ pub const SegmentsTLD = struct {
         segment.used -= 1;
 
         if (segment.used == 0) {
-            self.freeSegment(segment, force);
+            if (force) {
+                // Only free segment if explicitly forced
+                self.freeSegment(segment, true);
+            } else {
+                // Keep empty segment in free queue for reuse
+                // Only insert if not already in queue
+                if (self.freeQueue(segment)) |seg_queue| {
+                    if (!seg_queue.hasItem(segment)) {
+                        self.insertInFreeQueue(segment);
+                    }
+                }
+            }
         } else if (segment.used + 1 == segment.capacity) {
+            // Segment was full, now has free space - add to queue
             self.insertInFreeQueue(segment);
         }
     }

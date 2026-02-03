@@ -16,8 +16,9 @@ const Heap = heap_mod.Heap;
 const Segment = segment_mod.Segment;
 const TLD = tld_mod.TLD;
 
-const RETIRE_CYCLES: u8 = 128;
+const RETIRE_CYCLES: u8 = 128; // Reduced for faster page reuse
 const MAX_SCAN_PAGES = 8;
+const COLLECT_INTERVAL: usize = 512; // Trigger collection every N allocations
 
 // =============================================================================
 // Thread-Local State
@@ -25,6 +26,7 @@ const MAX_SCAN_PAGES = 8;
 
 threadlocal var tld: TLD = .{};
 threadlocal var tld_initialized: bool = false;
+threadlocal var alloc_counter: usize = 0; // Counter for periodic collection
 
 inline fn ensureTldInitialized() *TLD {
     if (!tld_initialized) {
@@ -96,25 +98,38 @@ inline fn mallocMedium(heap: *Heap, size: usize) ?[*]u8 {
     return null;
 }
 
-/// Set pages_free_direct for all wsizes that map to the same bin
-/// This ensures the fast path works for any size within a bin's range
-inline fn setDirectPointersForBin(heap: *Heap, page: *Page, bin: usize) void {
+/// Set pages_free_direct for the block_size's wsize
+/// The bin queue (via mallocMedium) handles other wsizes in the same bin
+inline fn setDirectPointerForBlockSize(heap: *Heap, page: *Page) void {
     if (page.block_size == 0) return;
 
     const block_wsize = (page.block_size + types.INTPTR_SIZE - 1) / types.INTPTR_SIZE;
-    if (block_wsize > types.SMALL_WSIZE_MAX) return;
-
-    // Find minimum wsize that maps to this bin
-    var wsize_min = block_wsize;
-    while (wsize_min > 1 and page_mod.binFromWsize(wsize_min - 1) == bin) {
-        wsize_min -= 1;
+    if (block_wsize <= types.SMALL_WSIZE_MAX) {
+        heap.pages_free_direct[block_wsize] = page;
     }
+}
 
-    // Set all entries in the bin range
-    var wsize = wsize_min;
-    while (wsize <= types.SMALL_WSIZE_MAX and page_mod.binFromWsize(wsize) == bin) {
-        heap.pages_free_direct[wsize] = page;
-        wsize += 1;
+/// Lightweight collection - only processes retire counters (called periodically)
+/// This is much faster than full collect() as it only decrements counters
+inline fn collectRetired(heap: *Heap) void {
+    // Only scan a subset of bins per call to keep it fast
+    const start_bin = alloc_counter % (types.BIN_HUGE + 1);
+    const end_bin = @min(start_bin + 16, types.BIN_HUGE + 1);
+
+    for (start_bin..end_bin) |bin| {
+        const pq = &heap.pages[bin];
+        if (pq.tail) |pg| {
+            // Only check the tail page (most likely to be empty)
+            if (pg.used == 0 and pg.capacity > 0 and pg.retire_expire > 0) {
+                pg.retire_expire -|= 1;
+                if (pg.retire_expire == 0) {
+                    // Time to retire this page
+                    pg.pageRemoveFromBin(heap, bin);
+                    clearDirectPointersForPage(heap, pg);
+                    tld.segments.freePage(pg, false);
+                }
+            }
+        }
     }
 }
 
@@ -166,35 +181,22 @@ inline fn mallocGeneric(heap: *Heap, size: usize, zero: bool) ?[*]u8 {
         page.pagePushBin(heap, bin);
     }
 
-    // Update direct pointers for ALL wsizes in this bin
-    // This ensures fast path works for any size within the bin's range
-    setDirectPointersForBin(heap, page, bin);
+    // Update direct pointer for the block_size's wsize
+    // Other wsizes in the bin will use mallocMedium's bin queue lookup
+    setDirectPointerForBlockSize(heap, page);
 
     return ptr;
 }
 
-/// Clear pages_free_direct for all wsizes that point to this page (reverse of setDirectPointersForBin)
+/// Clear pages_free_direct entry for this page's block_size wsize
 inline fn clearDirectPointersForPage(heap: *Heap, page: *Page) void {
     if (page.block_size == 0) return;
 
     const block_wsize = (page.block_size + types.INTPTR_SIZE - 1) / types.INTPTR_SIZE;
-    if (block_wsize > types.SMALL_WSIZE_MAX) return;
-
-    const bin = page_mod.binFromSize(page.block_size);
-
-    // Find minimum wsize that maps to this bin
-    var wsize_min = block_wsize;
-    while (wsize_min > 1 and page_mod.binFromWsize(wsize_min - 1) == bin) {
-        wsize_min -= 1;
-    }
-
-    // Clear all entries in the bin range that point to this page
-    var wsize = wsize_min;
-    while (wsize <= types.SMALL_WSIZE_MAX and page_mod.binFromWsize(wsize) == bin) {
-        if (heap.pages_free_direct[wsize] == page) {
-            heap.pages_free_direct[wsize] = null;
+    if (block_wsize <= types.SMALL_WSIZE_MAX) {
+        if (heap.pages_free_direct[block_wsize] == page) {
+            heap.pages_free_direct[block_wsize] = null;
         }
-        wsize += 1;
     }
 }
 
@@ -244,12 +246,12 @@ inline fn freeImpl(ptr: ?*anyopaque) void {
             const bin = page_mod.binFromSize(page.block_size);
             if (bin < heap.pages.len) {
                 page.pagePushBin(heap, bin);
-                // Update direct pointers so fast path can use this page
-                setDirectPointersForBin(heap, page, bin);
+                // Update direct pointer so fast path can use this page
+                setDirectPointerForBlockSize(heap, page);
             }
         }
 
-        // Check if page is completely empty
+        // Check if page is completely empty - retire if there are other pages in the bin
         if (page.used == 0 and page.capacity > 0 and tld_initialized) {
             @branchHint(.unlikely);
             const heap = &heap_mod.heap_main;
@@ -257,16 +259,14 @@ inline fn freeImpl(ptr: ?*anyopaque) void {
 
             if (bin < heap.pages.len) {
                 const pq = &heap.pages[bin];
-                // Only defer if this is the only page in the queue
-                if (pq.tail == page and page.prev == null) {
-                    // Sole page in queue - defer retirement
-                    if (page.retire_expire == 0) {
-                        page.retire_expire = RETIRE_CYCLES;
-                    }
-                } else {
-                    // Multiple pages in queue - retire immediately
+                // Only retire if there are OTHER pages in the queue
+                // This keeps at least one page per bin for fast reallocation
+                if (!(pq.tail == page and page.prev == null)) {
+                    // Multiple pages in queue - retire this empty one immediately
                     retirePage(page);
                 }
+                // If sole page in queue, keep it - it will be reused on next alloc
+                // The collectRetired will handle cleanup if it stays empty too long
             }
         }
     } else if (page_thread == 0) {
@@ -384,11 +384,13 @@ pub fn malloc(size: usize) ?[*]u8 {
         if (mallocSmallFast(heap, size)) |ptr| {
             @branchHint(.likely);
             return ptr;
-        } else {
-            @branchHint(.unlikely);
-            // Fall through to slow path for small sizes if fast path fails
-            return mallocGeneric(heap, size, false);
         }
+        // Try medium path (bin queue) before falling back to generic
+        if (mallocMedium(heap, size)) |ptr| {
+            return ptr;
+        }
+        // Fall through to slow path
+        return mallocGeneric(heap, size, false);
     }
 
     // Medium path (larger objects)
