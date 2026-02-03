@@ -302,11 +302,9 @@ pub const Page = struct {
         assert(self.page_start != null);
         assert(self.block_size > 0);
         assert(self.used <= self.capacity);
-        // assert(self.used > 0 or self.free.empty() and self.local_free.empty());
         // First try local free list (most common case after same-thread free)
         if (self.local_free.pop()) |block| {
             self.used += 1;
-            // assert((self.local_free.count() == 0) == (self.local_free.any.head == null));
             return block;
         }
 
@@ -329,6 +327,8 @@ pub const Page = struct {
 
     /// Push a freed block (same thread)
     pub fn pushFreeBlock(self: *Self, block: *Block) void {
+        // Initialize link before pushing (user may have overwritten this memory)
+        block.link = .{};
         self.local_free.push(block);
         self.used -|= 1;
     }
@@ -387,14 +387,23 @@ pub inline fn binFromSize(size: usize) usize {
 }
 
 /// Get block size for a bin index
+/// Returns the MAXIMUM size that maps to this bin, ensuring block_size >= any size in the bin
 pub fn blockSizeForBin(bin: usize) usize {
     if (bin <= 1) return types.INTPTR_SIZE;
     if (bin <= 8) return bin * types.INTPTR_SIZE;
 
-    // Reverse the binning formula
+    // Reverse the binning formula to get maximum wsize for this bin
+    // In binFromWsize: bin + 3 = (b << 2) | ((w >> (b-2)) & 3)
+    // where w = wsize - 1, and b = number of significant bits in w minus 1
     const b = (bin + 3) >> 2;
     const rem = (bin + 3) & 3;
-    const wsize = (@as(usize, 1) << b) | (rem << (b - 2));
+    const shift_b: u6 = @intCast(b);
+    const shift_b2: u6 = @intCast(b - 2);
+
+    // Maximum w with b+1 bits where bits (b-1, b-2) = rem:
+    // Set bit b (MSB), set bits (b-1, b-2) to rem, set all lower bits to 1
+    const max_w = (@as(usize, 1) << shift_b) | (rem << shift_b2) | ((@as(usize, 1) << shift_b2) - 1);
+    const wsize = max_w + 1;
 
     return wsize * types.INTPTR_SIZE;
 }

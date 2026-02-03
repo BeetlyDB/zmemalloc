@@ -16,7 +16,8 @@ const Heap = heap_mod.Heap;
 const Segment = segment_mod.Segment;
 const TLD = tld_mod.TLD;
 
-const RETIRE_CYCLES: u8 = 16;
+const RETIRE_CYCLES: u8 = 128;
+const MAX_SCAN_PAGES = 8;
 
 // =============================================================================
 // Thread-Local State
@@ -57,7 +58,12 @@ inline fn mallocSmallFast(heap: *Heap, size: usize) ?[*]u8 {
     const page = heap.pages_free_direct[wsize] orelse return null;
 
     // Try to get block from page
-    const block = page.popFreeBlock() orelse return null;
+    const block = page.popFreeBlock() orelse {
+        heap.pages_free_direct[wsize] = null;
+        return null;
+    };
+    // Reset retire counter - page is being used
+    page.retire_expire = 0;
 
     return @ptrCast(block);
 }
@@ -69,34 +75,56 @@ inline fn mallocMedium(heap: *Heap, size: usize) ?[*]u8 {
 
     const pq = &heap.pages[bin];
 
-    // Try to find page with free blocks that can fit our size
-    var page = pq.tail;
-    while (page) |pg| {
-        // Only use this page if its block_size can accommodate our request
-        if (pg.block_size >= size and pg.hasFree()) {
-            if (pg.popFreeBlock()) |block| {
-                page_mod.queueMoveToEnd(pq, pg);
-                return @ptrCast(block);
+    // Fast path: check only the first page (tail) - O(1)
+    // All pages in this bin have the same block_size = blockSizeForBin(bin)
+    if (pq.tail) |pg| {
+        @branchHint(.likely);
+        if (pg.popFreeBlock()) |block| {
+            // Reset retire counter - page is being used
+            pg.retire_expire = 0;
+            // If page is now full, remove from queue and mark as full
+            if (!pg.hasFree()) {
+                pg.pageRemoveFromBin(heap, bin);
+                pg.set_in_full(true);
+                // Clear direct pointers since page is full
+                clearDirectPointersForPage(heap, pg);
             }
+            return @ptrCast(block);
         }
-        page = pg.prev;
     }
 
     return null;
 }
 
-// =============================================================================
-// Slow Path (Generic) Allocation
-// =============================================================================
+/// Set pages_free_direct for all wsizes that map to the same bin
+/// This ensures the fast path works for any size within a bin's range
+inline fn setDirectPointersForBin(heap: *Heap, page: *Page, bin: usize) void {
+    if (page.block_size == 0) return;
+
+    const block_wsize = (page.block_size + types.INTPTR_SIZE - 1) / types.INTPTR_SIZE;
+    if (block_wsize > types.SMALL_WSIZE_MAX) return;
+
+    // Find minimum wsize that maps to this bin
+    var wsize_min = block_wsize;
+    while (wsize_min > 1 and page_mod.binFromWsize(wsize_min - 1) == bin) {
+        wsize_min -= 1;
+    }
+
+    // Set all entries in the bin range
+    var wsize = wsize_min;
+    while (wsize <= types.SMALL_WSIZE_MAX and page_mod.binFromWsize(wsize) == bin) {
+        heap.pages_free_direct[wsize] = page;
+        wsize += 1;
+    }
+}
 
 /// Generic allocation - slow path when fast path fails
 inline fn mallocGeneric(heap: *Heap, size: usize, zero: bool) ?[*]u8 {
     const t = heap.tld orelse return null;
 
-    // Determine page kind and allocate page if needed
-    // Block size must be aligned to INTPTR_SIZE for proper Block struct alignment
-    const aligned_size = ((size + types.INTPTR_SIZE - 1) / types.INTPTR_SIZE) * types.INTPTR_SIZE;
-    const block_size = @max(aligned_size, types.INTPTR_SIZE);
+    // Round up to bin's block size - this allows page reuse across similar sizes
+    const bin = page_mod.binFromSize(size);
+    const block_size = page_mod.blockSizeForBin(bin);
 
     // Get or create a page
     const page = t.segments.allocPage(block_size) orelse return null;
@@ -120,30 +148,55 @@ inline fn mallocGeneric(heap: *Heap, size: usize, zero: bool) ?[*]u8 {
     const block = page.popFreeBlock() orelse return null;
     const ptr: [*]u8 = @ptrCast(block);
 
+    if (types.DEBUG) {
+        const page_segment = Segment.fromPtr(page);
+        const ptr_segment = Segment.fromPtr(ptr);
+        assert(ptr_segment == page_segment);
+    }
+
     // Zero if requested
     if (zero) {
         @memset(ptr[0..block_size], 0);
     }
 
-    // Add page to heap queue
-    const bin = page_mod.binFromSize(block_size);
-    if (bin < heap.pages.len and !heap.pages[bin].hasItem(page)) {
-        // heap.pages[bin].push(page);
+    // Add page to heap queue if not already there
+    // Use in_bin flag to track queue membership
+    if (bin < heap.pages.len and !page.flags.page_flags.in_bin) {
+        page.set_in_full(false);
         page.pagePushBin(heap, bin);
     }
 
-    // Update direct pointer for small sizes
-    const wsize = (block_size + types.INTPTR_SIZE - 1) / types.INTPTR_SIZE;
-    if (wsize <= types.SMALL_WSIZE_MAX) {
-        heap.pages_free_direct[wsize] = page;
-    }
+    // Update direct pointers for ALL wsizes in this bin
+    // This ensures fast path works for any size within the bin's range
+    setDirectPointersForBin(heap, page, bin);
 
     return ptr;
 }
 
-// =============================================================================
-// Free
-// =============================================================================
+/// Clear pages_free_direct for all wsizes that point to this page (reverse of setDirectPointersForBin)
+inline fn clearDirectPointersForPage(heap: *Heap, page: *Page) void {
+    if (page.block_size == 0) return;
+
+    const block_wsize = (page.block_size + types.INTPTR_SIZE - 1) / types.INTPTR_SIZE;
+    if (block_wsize > types.SMALL_WSIZE_MAX) return;
+
+    const bin = page_mod.binFromSize(page.block_size);
+
+    // Find minimum wsize that maps to this bin
+    var wsize_min = block_wsize;
+    while (wsize_min > 1 and page_mod.binFromWsize(wsize_min - 1) == bin) {
+        wsize_min -= 1;
+    }
+
+    // Clear all entries in the bin range that point to this page
+    var wsize = wsize_min;
+    while (wsize <= types.SMALL_WSIZE_MAX and page_mod.binFromWsize(wsize) == bin) {
+        if (heap.pages_free_direct[wsize] == page) {
+            heap.pages_free_direct[wsize] = null;
+        }
+        wsize += 1;
+    }
+}
 
 //TODO: make in collect
 inline fn retirePage(page: *Page) void {
@@ -155,11 +208,8 @@ inline fn retirePage(page: *Page) void {
         page.pageRemoveFromBin(heap, bin);
     }
 
-    // clear direct lookup
-    const wsize = (page.block_size + types.INTPTR_SIZE - 1) / types.INTPTR_SIZE;
-    if (wsize <= types.SMALL_WSIZE_MAX and heap.pages_free_direct[wsize] == page) {
-        heap.pages_free_direct[wsize] = null;
-    }
+    // clear direct lookup for all wsizes in this bin
+    clearDirectPointersForPage(heap, page);
 
     // free page to segment
     tld.segments.freePage(page, false);
@@ -178,12 +228,47 @@ inline fn freeImpl(ptr: ?*anyopaque) void {
     const page_thread = segment.thread_id.load(.acquire);
 
     const block: *Block = @ptrCast(@alignCast(p));
-    block.link = .{};
 
     if (page_thread == current_thread) {
         @branchHint(.likely);
+        // Check if page was marked as full (not in queue)
+        const was_full = page.is_in_full();
+
         // Same thread - fast path
         page.pushFreeBlock(block);
+
+        // If page was full, add back to heap queue first
+        if (was_full and tld_initialized and page.block_size > 0) {
+            page.set_in_full(false);
+            const heap = &heap_mod.heap_main;
+            const bin = page_mod.binFromSize(page.block_size);
+            if (bin < heap.pages.len) {
+                page.pagePushBin(heap, bin);
+                // Update direct pointers so fast path can use this page
+                setDirectPointersForBin(heap, page, bin);
+            }
+        }
+
+        // Check if page is completely empty
+        if (page.used == 0 and page.capacity > 0 and tld_initialized) {
+            @branchHint(.unlikely);
+            const heap = &heap_mod.heap_main;
+            const bin = page_mod.binFromSize(page.block_size);
+
+            if (bin < heap.pages.len) {
+                const pq = &heap.pages[bin];
+                // Only defer if this is the only page in the queue
+                if (pq.tail == page and page.prev == null) {
+                    // Sole page in queue - defer retirement
+                    if (page.retire_expire == 0) {
+                        page.retire_expire = RETIRE_CYCLES;
+                    }
+                } else {
+                    // Multiple pages in queue - retire immediately
+                    retirePage(page);
+                }
+            }
+        }
     } else if (page_thread == 0) {
         @branchHint(.likely);
         // Abandoned segment - just push to local free
@@ -280,10 +365,6 @@ pub const ZMemAllocator = struct {
         freeImpl(buf.ptr);
     }
 };
-
-// =============================================================================
-// C-style API
-// =============================================================================
 
 /// Maximum size for fast path (fits in direct page lookup)
 const MAX_FAST_SIZE: usize = types.SMALL_WSIZE_MAX * types.INTPTR_SIZE;
@@ -398,6 +479,102 @@ pub fn isInHeapRegion(ptr: ?*const anyopaque) bool {
     return segment_start != 0;
 }
 
+/// Collect and return unused memory to the OS
+/// Call this periodically or when memory pressure is high
+/// Returns number of pages purged
+pub fn collect(force: bool) usize {
+    if (!tld_initialized) return 0;
+
+    var collected: usize = 0;
+
+    // Collect unused memory from segments
+    collected += tld.segments.collect(force);
+
+    // Clean up heap's page queues - decrement retire_expire and retire when 0
+    const heap = &heap_mod.heap_main;
+    for (&heap.pages, 0..) |*pq, bin| {
+        var page = pq.tail;
+        while (page) |pg| {
+            const next = pg.prev;
+            if (pg.used == 0 and pg.capacity > 0) {
+                if (force) {
+                    // Force retire
+                    pg.pageRemoveFromBin(heap, bin);
+                    clearDirectPointersForPage(heap, pg);
+                    tld.segments.freePage(pg, true);
+                    collected += 1;
+                } else if (pg.retire_expire > 0) {
+                    // Decrement expire counter
+                    pg.retire_expire -= 1;
+                    if (pg.retire_expire == 0) {
+                        // Time to retire
+                        pg.pageRemoveFromBin(heap, bin);
+                        clearDirectPointersForPage(heap, pg);
+                        tld.segments.freePage(pg, false);
+                        collected += 1;
+                    }
+                }
+            }
+            page = next;
+        }
+    }
+
+    // Handle empty pages from direct pointers (might not be in queue)
+    // Note: We iterate a copy to avoid issues during clearing
+    var pages_to_check: [types.PAGES_DIRECT]?*Page = undefined;
+    inline for (&heap.pages_free_direct, 0..) |direct, i| {
+        @setEvalBranchQuota(10_000);
+        pages_to_check[i] = direct;
+    }
+
+    for (pages_to_check) |maybe_pg| {
+        const pg = maybe_pg orelse continue;
+        if (pg.used == 0 and pg.capacity > 0) {
+            if (force) {
+                clearDirectPointersForPage(heap, pg);
+                const bin = page_mod.binFromSize(pg.block_size);
+                pg.pageRemoveFromBin(heap, bin);
+                tld.segments.freePage(pg, true);
+                collected += 1;
+            } else if (pg.retire_expire > 0) {
+                pg.retire_expire -= 1;
+                if (pg.retire_expire == 0) {
+                    clearDirectPointersForPage(heap, pg);
+                    const bin = page_mod.binFromSize(pg.block_size);
+                    pg.pageRemoveFromBin(heap, bin);
+                    tld.segments.freePage(pg, false);
+                    collected += 1;
+                }
+            }
+        }
+    }
+
+    return collected;
+}
+
+/// Get memory statistics
+pub fn getStats() struct {
+    segments_count: usize,
+    segments_size: usize,
+    peak_segments: usize,
+    peak_size: usize,
+} {
+    if (!tld_initialized) return .{
+        .segments_count = 0,
+        .segments_size = 0,
+        .peak_segments = 0,
+        .peak_size = 0,
+    };
+
+    const stats = tld.segments.getStats();
+    return .{
+        .segments_count = stats.count,
+        .segments_size = stats.current_size,
+        .peak_segments = stats.peak_count,
+        .peak_size = stats.peak_size,
+    };
+}
+
 /// Aligned allocation (internal)
 fn alignedAlloc(alignment: usize, size: usize) ?*anyopaque {
     if (size == 0) return null;
@@ -499,6 +676,17 @@ export fn c_malloc_usable_size(ptr: ?*anyopaque) usize {
 /// Deinitialize thread (call before thread exit for cleanup)
 export fn zmem_thread_deinit() void {
     deinitThread();
+}
+
+/// Collect unused memory and return to OS
+/// force=true to aggressively return all unused memory
+export fn zmem_collect(force: bool) usize {
+    return collect(force);
+}
+
+/// Get current memory usage in bytes
+export fn zmem_get_memory_usage() usize {
+    return getStats().segments_size;
 }
 
 // =============================================================================
@@ -1432,7 +1620,7 @@ test "benchmark: zmemalloc vs smp_allocator" {
 }
 
 test "benchmark: mixed workload" {
-    const num_ptrs = 1000;
+    const num_ptrs = 10000;
     const iterations = 100;
 
     std.debug.print("\n=== Mixed Workload Benchmark ===\n", .{});
@@ -1475,6 +1663,8 @@ test "benchmark: mixed workload" {
                 if (p) |ptr| free_mem(ptr);
             }
         }
+
+        // Collect at the end
         break :blk timer.read();
     };
 

@@ -127,6 +127,13 @@ pub const Segment = struct {
     pub inline fn pageFromPtr(p: *const anyopaque) *Page {
         const segment = fromPtr(p);
         const diff = @intFromPtr(p) - @intFromPtr(segment);
+
+        // Validate segment looks reasonable
+        assert(segment.page_shift >= types.SMALL_PAGE_SHIFT);
+        assert(segment.page_shift <= types.SEGMENT_SHIFT);
+        assert(segment.capacity > 0);
+        assert(segment.capacity <= types.SLICES_PER_SEGMENT);
+
         const shift: u6 = @intCast(segment.page_shift);
         const slice_idx = diff >> shift;
 
@@ -136,6 +143,10 @@ pub const Segment = struct {
 
         // Page index is slice index minus header slices
         const page_idx = slice_idx -| header_slices;
+
+        // Validate page index
+        assert(page_idx < segment.capacity);
+
         return &segment.pages[page_idx];
     }
 
@@ -167,7 +178,7 @@ pub const Segment = struct {
         // Memory is already mapped, just mark as committed
         pg.flags.is_commited = true;
         pg.used = 0;
-        pg.free = queue.IntrusiveLifo(page_mod.Block).init();
+        pg.free = .init();
         pg.flags.is_zero_init = false;
         return true;
     }
@@ -214,8 +225,10 @@ pub const Segment = struct {
     // Static Methods
     // =========================================================================
 
-    pub fn calculateSizes(capacity: usize, required: usize) struct { segment_size: usize, info_size: usize } {
-        const minsize = @sizeOf(Self) + (capacity -| 1) * @sizeOf(Page) + 16;
+    pub inline fn calculateSizes(capacity: usize, required: usize) struct { segment_size: usize, info_size: usize } {
+        _ = capacity; // Capacity is already accounted for in @sizeOf(Segment)
+        // Segment struct includes pages: [512]Page array, so just use struct size
+        const minsize = @sizeOf(Self) + 16;
         const info_size = util.alignUp(minsize, 16 * types.MAX_ALIGN_SIZE);
 
         const segment_size = if (required == 0)
@@ -226,7 +239,7 @@ pub const Segment = struct {
         return .{ .segment_size = segment_size, .info_size = info_size };
     }
 
-    pub fn capacityForKind(kind: PageKind, page_shift: usize) usize {
+    pub inline fn capacityForKind(kind: PageKind, page_shift: usize) usize {
         const total_slices = types.SEGMENT_SIZE >> @intCast(page_shift);
 
         // Reserve slices for segment header
@@ -649,23 +662,41 @@ pub const SegmentsTLD = struct {
         kind: Segment.PageKind,
         page_shift: usize,
     ) ?*Page {
-        //WARN: NOW ITS NOW WORKING AND WE GET SEGFAULT WHEN REUSE PAGES
-        //FIX: fix this
         // Try existing segments first
-        // if (self.tryAllocInQueue(kind)) |pg| {
-        //     pg.block_size = block_size;
-        //
-        //     return pg;
-        // }
+        // Note: tryAllocInQueue -> findFreePage -> pageClaim already claims the page
+        // and removes segment from free queue if it becomes full
+        if (self.tryAllocInQueue(kind)) |pg| {
+            // Page is already claimed by findFreePage, just reinitialize for new block size
+            pg.block_size = block_size;
+            pg.page_start = null; // Will be set on first alloc
+            pg.capacity = 0;
+            pg.reserved = 0;
+            pg.used = 0;
+            pg.free = .init();
+            pg.local_free = .init();
+            pg.xthread_free.store(null, .release);
+            pg.next = null;
+            pg.prev = null;
+            pg.flags.page_flags = .{}; // Reset all page flags
+            pg.retire_expire = 0;
+
+            return pg;
+        }
 
         // Allocate new segment
         const segment = self.allocSegment(0, kind, page_shift) orelse return null;
         self.insertInFreeQueue(segment);
 
-        const pg = segment.findFreePage() orelse return null;
+        // findFreePage already calls pageClaim internally
+        const pg = segment.findFreePage() orelse {
+            self.freeSegment(segment, true);
+            return null;
+        };
+
         if (!segment.hasFree()) {
             self.removeFromFreeQueue(segment);
         }
+
         pg.block_size = block_size;
         return pg;
     }
