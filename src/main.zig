@@ -55,7 +55,8 @@ pub fn main() !void {
     };
 
     const zmem_time = blk: {
-        const zmem = zmemalloc.allocator();
+        const smp = zmemalloc.allocator();
+        prng = std.Random.DefaultPrng.init(12345); // Reset PRNG
         var timer = std.time.Timer.start() catch break :blk @as(u64, 0);
         for (0..iterations) |_| {
             var ptrs: [num_ptrs]?[]u8 = undefined;
@@ -64,13 +65,13 @@ pub fn main() !void {
             // Allocate all
             for (&ptrs) |*p| {
                 const size = 16 + random.uintLessThan(usize, 1024);
-                p.* = zmem.alloc(u8, size) catch null;
+                p.* = smp.alloc(u8, size) catch null;
             }
 
             // Free random half
             for (&ptrs) |*p| {
                 if (random.boolean()) {
-                    if (p.*) |ptr| zmem.free(ptr);
+                    if (p.*) |slice| smp.free(slice);
                     p.* = null;
                 }
             }
@@ -79,19 +80,19 @@ pub fn main() !void {
             for (&ptrs) |*p| {
                 if (p.* == null) {
                     const size = 16 + random.uintLessThan(usize, 1024);
-                    p.* = zmem.alloc(u8, size) catch null;
+                    p.* = smp.alloc(u8, size) catch null;
                 }
             }
 
             // Free all
             for (ptrs) |p| {
-                if (p) |ptr| zmem.free(ptr);
+                if (p) |slice| smp.free(slice);
             }
         }
         break :blk timer.read();
     };
 
-    // smp_allocator
+    // // smp_allocator
     const mimalloc_time = blk: {
         const smp = mimalloc.mimalloc_allocator;
         prng = std.Random.DefaultPrng.init(12345); // Reset PRNG
@@ -129,7 +130,7 @@ pub fn main() !void {
         }
         break :blk timer.read();
     };
-
+    //
     const c_time = blk: {
         const c = std.heap.c_allocator;
         prng = std.Random.DefaultPrng.init(12345); // Reset PRNG
@@ -169,10 +170,10 @@ pub fn main() !void {
 
         break :blk timer.read();
     };
-
-    // ------------------------------------------------------------
-    // Results
-    // ------------------------------------------------------------
+    //
+    // // ------------------------------------------------------------
+    // // Results
+    // // ------------------------------------------------------------
     const zmem_ms = @as(f64, @floatFromInt(zmem_time)) / 1_000_000.0;
     const smp_ms = @as(f64, @floatFromInt(smp_time)) / 1_000_000.0;
     const mi_ms = @as(f64, @floatFromInt(mimalloc_time)) / 1_000_000.0;

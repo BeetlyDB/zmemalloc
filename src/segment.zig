@@ -87,8 +87,17 @@ pub const Segment = struct {
 
     /// Get raw start of page memory
     pub inline fn rawPageStart(self: *const Self, pg: *const Page, page_size_out: ?*usize) [*]u8 {
-        const psize_raw = self.rawPageSize();
         const base: [*]u8 = @ptrFromInt(@intFromPtr(self));
+
+        // For large/huge pages (capacity=1), data starts right after aligned header
+        if (self.capacity == 1) {
+            const psize = self.segment_size - self.segment_info_size;
+            if (page_size_out) |ps| ps.* = psize;
+            return base + self.segment_info_size;
+        }
+
+        // Small/medium: multiple pages per segment
+        const psize_raw = @as(usize, 1) << @intCast(self.page_shift);
 
         // Calculate how many page-sized slices the segment header uses
         const info_slices = (self.segment_info_size + psize_raw - 1) / psize_raw;

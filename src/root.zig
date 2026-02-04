@@ -76,12 +76,23 @@ inline fn mallocSmallFast(heap: *Heap, size: usize) ?[*]u8 {
     const wsize = (size + types.INTPTR_SIZE - 1) / types.INTPTR_SIZE;
     const page = heap.pages_free_direct[wsize] orelse return null;
 
-    const block = page.popFreeBlock() orelse {
-        heap.pages_free_direct[wsize] = null;
-        return null;
-    };
+    if (page.popFreeBlock()) |block| {
+        return @ptrCast(block);
+    }
 
-    return @ptrCast(block);
+    // Page has no free blocks - try bin queue's tail directly
+    const bin = page_mod.binFromSize(size);
+    if (bin < heap.pages.len) {
+        if (heap.pages[bin].tail) |pg| {
+            heap.pages_free_direct[wsize] = pg;
+            // Try to allocate from the new page
+            if (pg.popFreeBlock()) |block| {
+                return @ptrCast(block);
+            }
+        }
+    }
+    heap.pages_free_direct[wsize] = null;
+    return null;
 }
 
 /// Medium allocation path
@@ -187,10 +198,11 @@ inline fn mallocGeneric(heap: *Heap, size: usize, zero: bool) ?[*]u8 {
         pg.init(block_size, page_start, page_size);
     }
 
-    // Extend free list if needed
+    // Extend free list if needed - use larger batch
     if (pg.free.empty() and pg.reserved < pg.capacity) {
         @branchHint(.cold);
-        const extend = @min(16, pg.capacity - pg.reserved);
+        const batch = if (pg.extend_batch > 0) @as(usize, pg.extend_batch) else 16;
+        const extend = @min(batch, pg.capacity - pg.reserved);
         pg.extendFree(extend);
     }
 
@@ -1712,6 +1724,7 @@ test "benchmark: zmemalloc vs smp_allocator" {
         16384,
         16384 * 2,
         32768 * 2,
+        65536 * 2,
     };
 
     std.debug.print("\n\n=== Allocator Benchmark ({} iterations per size) ===\n", .{iterations});

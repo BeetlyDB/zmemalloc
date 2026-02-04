@@ -15,7 +15,7 @@ const heap = @import("heap.zig");
 // │                          Data                                  │
 // └────────────────────────────────────────────────────────────────┘
 //
-// Free memory (same 64 байта):
+// Free memory (same 64 bytes):
 // ┌──────────┬─────────────────────────────────────────────────────┐
 // │  *Block  │              not used                               │
 // │  .link   │                                                     │
@@ -82,6 +82,10 @@ pub const Page = struct {
 
     block_size: usize = 0,
     page_start: ?[*]u8 = null,
+
+    // Extension configuration - calculated once at init
+    extend_threshold: u16 = 0, // Extend when free count drops below this
+    extend_batch: u16 = 0, // Number of blocks to extend at once
 
     xthread_free: Atomic(?*Block) = .init(null), // cross-thread free list (atomic)
 
@@ -177,6 +181,43 @@ pub const Page = struct {
             self.block_size_shift = 0;
         }
 
+        // Calculate extension parameters based on capacity
+        // Minimize extendFree calls while keeping memory pressure reasonable
+        if (self.capacity > 0) {
+            // Extend batch: larger pages get larger batches
+            // Always capped at capacity to avoid over-extension
+            const cap = self.capacity;
+            var batch: u16 = undefined;
+
+            if (cap <= 8) {
+                // Very small pages (huge allocations): extend all at once
+                batch = cap;
+            } else if (cap <= 64) {
+                // Small pages: extend 1/4 of capacity, min 8
+                batch = @intCast(@max(8, cap / 4));
+            } else if (cap <= 256) {
+                // Medium pages: extend 1/8 of capacity, min 32
+                batch = @intCast(@max(32, cap / 8));
+            } else {
+                // Large pages: extend 1/16 of capacity, min 64, max 256
+                batch = @intCast(@min(256, @max(64, cap / 16)));
+            }
+
+            // Ensure batch never exceeds capacity
+            self.extend_batch = @min(batch, cap);
+
+            // Threshold: extend when free count drops below this
+            // For small capacities, use capacity/2; otherwise 2x batch or capacity/4
+            if (cap <= 16) {
+                self.extend_threshold = cap / 2;
+            } else {
+                self.extend_threshold = @min(self.extend_batch * 2, cap / 4);
+            }
+        } else {
+            self.extend_batch = 0;
+            self.extend_threshold = 0;
+        }
+
         self.flags.free_is_zero = self.flags.is_zero_init;
         self.retire_expire = 0;
     }
@@ -206,21 +247,50 @@ pub const Page = struct {
         const actual_extend = @min(extend_count, capacity - reserved);
         const block_start = start + reserved * bsize;
 
-        // Add blocks to free list in reverse order for better locality
+        // Add blocks to free list in reverse order for better pop locality
+        // (first block added = first block popped)
         var i: usize = actual_extend;
         while (i > 0) : (i -= 1) {
             const block: *Block = @ptrCast(@alignCast(block_start + (i - 1) * bsize));
-            // Initialize link before pushing (memory may contain garbage)
-            // block.link = .{};
             self.free.push(block);
         }
 
         self.reserved += @intCast(actual_extend);
     }
 
+    /// Extend free list using the page's configured batch size
+    /// Returns true if extension happened
+    pub inline fn extendFreeAuto(self: *Self) bool {
+        if (self.reserved >= self.capacity) return false;
+        const batch = if (self.extend_batch > 0) self.extend_batch else 16;
+        const remaining = self.capacity - self.reserved;
+        const extend = @min(batch, remaining);
+        if (extend == 0) return false;
+        self.extendFree(extend);
+        return true;
+    }
+
+    /// Check if free list needs extension (below threshold)
+    /// Uses O(1) calculation: free_count = reserved - used
+    pub inline fn needsExtension(self: *const Self) bool {
+        if (self.reserved >= self.capacity) return false;
+        // Approximate free count = reserved - used
+        // This doesn't account for local_free/xthread_free but is fast
+        const approx_free = if (self.reserved > self.used) self.reserved - self.used else 0;
+        return approx_free < self.extend_threshold;
+    }
+
     /// Check if page has any free blocks
     pub inline fn hasFree(self: *const Self) bool {
-        return !self.free.empty() or !self.local_free.empty() or self.xthread_free.load(.acquire) != null;
+        // Check thread-local lists first (cheap)
+        if (!self.free.empty() or !self.local_free.empty()) {
+            @branchHint(.likely);
+            return true;
+        } else {
+            // Only check xthread if local lists are empty (cold path)
+            @branchHint(.unlikely);
+            return self.xthread_free.load(.monotonic) != null;
+        }
     }
 
     /// Check if all blocks are used

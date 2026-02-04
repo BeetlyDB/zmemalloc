@@ -14,26 +14,13 @@ pub const Heap = struct {
     thread_id: usize = 0, // TLD address for fast thread check
     arena_id: usize = 0,
     page_count: usize = 0,
-    page_retired_min: usize = 0,
-    page_retired_max: usize = 0,
 
-    generic_count: i64 = 0,
-    generic_collect_count: i64 = 0,
-    // intrusive list of heaps per thread
-    link: queue.IntrusiveLifo(Heap).Link = .{},
     no_reclaim: bool = false,
     tag: u8 = 0,
 
     pages_free_direct: [types.PAGES_DIRECT]?*page.Page = [_]?*page.Page{null} ** types.PAGES_DIRECT,
 
-    // intrusive linked list for heap in thread
-    prev: ?*Heap = null,
-    next: ?*Heap = null,
-
     pages: [types.BIN_FULL + 1]page.Page.Queue = [_]page.Page.Queue{.{}} ** (types.BIN_FULL + 1),
-
-    pub const Queue = queue.DoublyLinkedListType(Heap, .next, .prev);
-    pub const List = queue.IntrusiveLifo(Heap);
 
     pub inline fn isBacking(self: *const Heap) bool {
         const t = self.tld orelse return false;

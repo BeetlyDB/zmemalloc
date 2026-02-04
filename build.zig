@@ -26,7 +26,6 @@ pub fn build(b: *std.Build) void {
             "-std=c11",
             "-O3",
             "-march=native",
-            "-flto",
             "-ffunction-sections",
             "-fdata-sections",
             "-fvisibility=hidden",
@@ -43,8 +42,6 @@ pub fn build(b: *std.Build) void {
             "-DMI_OVERRIDE=0",
             "-DMI_TRACK_ASAN=0",
             "-DMI_NO_THP=1", //transperent huge pages
-            "-fno-sanitize=undefined",
-            "-fno-sanitize-trap=undefined",
             "-ffast-math",
             "-fomit-frame-pointer",
         },
@@ -129,7 +126,7 @@ fn build_library(b: *std.Build, name: []const u8, module: *std.Build.Module) *st
         .root_module = module,
         .linkage = .static,
     });
-    strip_step(l);
+    // strip_step(l);
 
     return l;
 }
@@ -160,7 +157,7 @@ fn build_module(
     options: std.Build.Module.CreateOptions,
 ) *std.Build.Module {
     const m = b.createModule(options);
-    strip(m);
+    // strip(m);
     return m;
 }
 

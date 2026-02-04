@@ -20,7 +20,6 @@ pub const TLD = struct {
     recurse: bool = false,
 
     heap_backing: ?*heap.Heap = null,
-    heaps: heap.Heap.Queue = .{}, // intrusive list of heaps
 
     os_allocator: os_alloc.OsAllocator = .{ .config = os.mem_config_static },
     segments: SegmentsTLD = .{},
