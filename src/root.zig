@@ -146,6 +146,26 @@ inline fn mallocGeneric(heap: *Heap, size: usize, zero: bool) ?[*]u8 {
     const bin = page_mod.binFromSize(size);
     const block_size = page_mod.blockSizeForBin(bin);
 
+    // Check bin queue first for all sizes (including large)
+    // This allows page reuse for sizes > MEDIUM_OBJ_SIZE_MAX
+    if (bin < heap.pages.len) {
+        const pq = &heap.pages[bin];
+        if (pq.tail) |pg| {
+            if (pg.popFreeBlock()) |block| {
+                if (!pg.hasFree()) {
+                    pg.pageRemoveFromBin(heap, bin);
+                    pg.set_in_full(true);
+                    clearDirectPointersForPage(heap, pg);
+                }
+                const ptr: [*]u8 = @ptrCast(block);
+                if (zero) {
+                    @memset(ptr[0..block_size], 0);
+                }
+                return ptr;
+            }
+        }
+    }
+
     // Try to get a page, reclaim abandoned segments if needed
     var page = t.segments.allocPage(block_size);
     if (page == null) {
@@ -196,7 +216,6 @@ inline fn mallocGeneric(heap: *Heap, size: usize, zero: bool) ?[*]u8 {
         pg.set_in_full(false);
         pg.pagePushBin(heap, bin);
     }
-
     // Update direct pointer for the block_size's wsize
     // Other wsizes in the bin will use mallocMedium's bin queue lookup
     setDirectPointerForBlockSize(heap, pg);
@@ -581,8 +600,9 @@ pub fn threadExit() void {
     var abandon_count: usize = 0;
 
     // Collect segments from free queues
-    inline for ([_]*segment_mod.SegmentQueue{ &tld.segments.small_free, &tld.segments.medium_free }) |q| {
+    inline for ([_]*segment_mod.SegmentQueue{ &tld.segments.small_free, &tld.segments.medium_free, &tld.segments.large_free }) |q| {
         while (q.pop()) |seg| {
+            seg.in_free_queue = false;
             if (seg.thread_id.load(.acquire) == current_thread) {
                 if (abandon_count < segments_to_abandon.len) {
                     segments_to_abandon[abandon_count] = seg;

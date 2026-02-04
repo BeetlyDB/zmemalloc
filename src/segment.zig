@@ -39,6 +39,7 @@ pub const Segment = struct {
     // Segment state
     was_reclaimed: bool = false,
     dont_free: bool = false,
+    in_free_queue: bool = false, // Track queue membership (avoids O(n) hasItem)
 
     abandoned: usize = 0,
     abandoned_visits: usize = 0,
@@ -398,6 +399,7 @@ pub const SegmentsTLD = struct {
     // Free segment queues for reuse (by page kind)
     small_free: SegmentQueue = .{},
     medium_free: SegmentQueue = .{},
+    large_free: SegmentQueue = .{}, // Cache for large segments (one page per segment)
 
     // spans per size bin
     spans: [types.SEGMENTS_BIN_MAX + 1]SegmentList = [_]SegmentList{SegmentList.init()} ** (types.SEGMENTS_BIN_MAX + 1),
@@ -431,7 +433,8 @@ pub const SegmentsTLD = struct {
         return switch (kind) {
             .small => &self.small_free,
             .medium => &self.medium_free,
-            else => null,
+            .large => &self.large_free,
+            .huge => null, // Huge segments are unique-sized, not cacheable
         };
     }
 
@@ -440,15 +443,17 @@ pub const SegmentsTLD = struct {
     }
 
     pub inline fn removeFromFreeQueue(self: *Self, segment: *Segment) void {
+        if (!segment.in_free_queue) return; // O(1) check instead of O(n) hasItem
         const q = self.freeQueue(segment) orelse return;
-        if (q.hasItem(segment)) {
-            q.remove(segment);
-        }
+        q.remove(segment);
+        segment.in_free_queue = false;
     }
 
     pub inline fn insertInFreeQueue(self: *Self, segment: *Segment) void {
+        if (segment.in_free_queue) return; // Already in queue
         const q = self.freeQueue(segment) orelse return;
         q.push(segment);
+        segment.in_free_queue = true;
     }
 
     // =========================================================================
@@ -632,12 +637,8 @@ pub const SegmentsTLD = struct {
                 self.freeSegment(segment, true);
             } else {
                 // Keep empty segment in free queue for reuse
-                // Only insert if not already in queue
-                if (self.freeQueue(segment)) |seg_queue| {
-                    if (!seg_queue.hasItem(segment)) {
-                        self.insertInFreeQueue(segment);
-                    }
-                }
+                // Use in_free_queue flag (O(1)) instead of hasItem (O(n))
+                self.insertInFreeQueue(segment);
             }
         } else if (segment.used + 1 == segment.capacity) {
             // Segment was full, now has free space - add to queue
@@ -717,6 +718,29 @@ pub const SegmentsTLD = struct {
     }
 
     pub inline fn allocLargePage(self: *Self, block_size: usize) ?*Page {
+        // Try to reuse a cached large segment first
+        if (self.large_free.pop()) |seg| {
+            seg.in_free_queue = false;
+            const pg = &seg.pages[0];
+            // Reinitialize the page
+            pg.segment_in_use = true;
+            pg.block_size = block_size;
+            pg.page_start = null; // Will be set on first alloc
+            pg.capacity = 0;
+            pg.reserved = 0;
+            pg.used = 0;
+            pg.free = .init();
+            pg.local_free = .init();
+            pg.xthread_free.store(null, .release);
+            pg.next = null;
+            pg.prev = null;
+            pg.flags.page_flags = .{};
+            pg.retire_expire = 0;
+            seg.used = 1;
+            return pg;
+        }
+
+        // Allocate new segment
         const segment = self.allocSegment(0, .large, types.SEGMENT_SHIFT) orelse return null;
 
         const pg = &segment.pages[0];
@@ -826,7 +850,7 @@ pub const SegmentsTLD = struct {
         const now = std.time.milliTimestamp();
 
         // Iterate through free queues and purge expired pages
-        inline for ([_]*SegmentQueue{ &self.small_free, &self.medium_free }) |q| {
+        inline for ([_]*SegmentQueue{ &self.small_free, &self.medium_free, &self.large_free }) |q| {
             var segment = q.tail;
             while (segment) |seg| {
                 if (force) {
@@ -868,10 +892,12 @@ pub const SegmentsTLD = struct {
         // Free empty segments from small queue
         while (!self.isWithinTarget(target_count)) {
             const seg = self.small_free.pop() orelse break;
+            seg.in_free_queue = false;
             if (seg.used == 0) {
                 self.freeSegment(seg, true);
                 freed += 1;
             } else {
+                seg.in_free_queue = true;
                 self.small_free.push(seg);
                 break;
             }
@@ -880,11 +906,27 @@ pub const SegmentsTLD = struct {
         // Free empty segments from medium queue
         while (!self.isWithinTarget(target_count)) {
             const seg = self.medium_free.pop() orelse break;
+            seg.in_free_queue = false;
             if (seg.used == 0) {
                 self.freeSegment(seg, true);
                 freed += 1;
             } else {
+                seg.in_free_queue = true;
                 self.medium_free.push(seg);
+                break;
+            }
+        }
+
+        // Free empty segments from large queue
+        while (!self.isWithinTarget(target_count)) {
+            const seg = self.large_free.pop() orelse break;
+            seg.in_free_queue = false;
+            if (seg.used == 0) {
+                self.freeSegment(seg, true);
+                freed += 1;
+            } else {
+                seg.in_free_queue = true;
+                self.large_free.push(seg);
                 break;
             }
         }
@@ -1196,17 +1238,18 @@ test "SegmentsTLD: freeQueueOfKind" {
 
     var tld = SegmentsTLD{};
 
-    // Small and medium have queues
+    // Small, medium, and large have queues
     try testing.expect(tld.freeQueueOfKind(.small) != null);
     try testing.expect(tld.freeQueueOfKind(.medium) != null);
+    try testing.expect(tld.freeQueueOfKind(.large) != null);
 
-    // Large and huge don't use queues
-    try testing.expect(tld.freeQueueOfKind(.large) == null);
+    // Huge don't use queues (unique sized)
     try testing.expect(tld.freeQueueOfKind(.huge) == null);
 
     // Verify they return correct queue pointers
     try testing.expectEqual(&tld.small_free, tld.freeQueueOfKind(.small).?);
     try testing.expectEqual(&tld.medium_free, tld.freeQueueOfKind(.medium).?);
+    try testing.expectEqual(&tld.large_free, tld.freeQueueOfKind(.large).?);
 }
 
 test "SegmentsTLD: queue management" {
