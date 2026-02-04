@@ -1290,7 +1290,7 @@ test "SegmentsTLD: freeQueue by segment" {
 
     try testing.expectEqual(&tld.small_free, tld.freeQueue(&small_seg).?);
     try testing.expectEqual(&tld.medium_free, tld.freeQueue(&medium_seg).?);
-    try testing.expect(tld.freeQueue(&large_seg) == null);
+    try testing.expectEqual(&tld.large_free, tld.freeQueue(&large_seg).?);
 }
 
 test "Segment: calculateSizes alignment" {
