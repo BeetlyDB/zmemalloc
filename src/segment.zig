@@ -10,6 +10,7 @@ const arena_mod = @import("arena.zig");
 const util = @import("util.zig");
 const os_mod = @import("os.zig");
 const assert = util.assert;
+const subproc_m = @import("subproc.zig");
 
 const Atomic = std.atomic.Value;
 const Page = page_mod.Page;
@@ -421,7 +422,7 @@ pub const SegmentsTLD = struct {
     current_size: usize = 0,
     peak_size: usize = 0,
     reclaim_count: usize = 0,
-    subproc: ?*anyopaque = null,
+    subproc: ?*subproc_m.Subproc = null,
     stats: ?*Stats = null,
 
     os_alloc: std.mem.Allocator = undefined,
@@ -586,7 +587,7 @@ pub const SegmentsTLD = struct {
         return segment;
     }
 
-    pub fn freeSegment(self: *Self, segment: *Segment, force: bool) void {
+    pub inline fn freeSegment(self: *Self, segment: *Segment, force: bool) void {
         self.removeFromFreeQueue(segment);
 
         // Purge all uncommitted pages

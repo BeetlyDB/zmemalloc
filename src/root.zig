@@ -8,6 +8,7 @@ const segment_mod = @import("segment.zig");
 const tld_mod = @import("tld.zig");
 const os = @import("os.zig");
 const os_alloc = @import("os_allocator.zig");
+const Subproc = @import("subproc.zig").Subproc;
 
 const Atomic = std.atomic.Value;
 const Page = page_mod.Page;
@@ -15,10 +16,22 @@ const Block = page_mod.Block;
 const Heap = heap_mod.Heap;
 const Segment = segment_mod.Segment;
 const TLD = tld_mod.TLD;
+const SegmentAbandonedQueue = segment_mod.SegmentAbandonedQueue;
 
-const RETIRE_CYCLES: u8 = 128; // Reduced for faster page reuse
+const RETIRE_CYCLES: u8 = 128;
 const MAX_SCAN_PAGES = 8;
-const COLLECT_INTERVAL: usize = 512; // Trigger collection every N allocations
+const COLLECT_INTERVAL: usize = 512;
+const ABANDON_RECLAIM_LIMIT: usize = 8; // Max segments to reclaim per allocation
+
+// =============================================================================
+// Global State (Process-wide)
+// =============================================================================
+
+/// Global subproc for abandoned segments management
+var global_subproc: Subproc = .{};
+
+/// Count of active threads using the allocator
+var active_thread_count: Atomic(usize) = .init(0);
 
 // =============================================================================
 // Thread-Local State
@@ -26,27 +39,24 @@ const COLLECT_INTERVAL: usize = 512; // Trigger collection every N allocations
 
 threadlocal var tld: TLD = .{};
 threadlocal var tld_initialized: bool = false;
-threadlocal var alloc_counter: usize = 0; // Counter for periodic collection
+threadlocal var alloc_counter: usize = 0;
 
 inline fn ensureTldInitialized() *TLD {
     if (!tld_initialized) {
         initTld(&tld);
         tld_initialized = true;
+        _ = active_thread_count.fetchAdd(1, .monotonic);
     }
     return &tld;
 }
 
 inline fn initTld(t: *TLD) void {
-    // Initialize segments with os_allocator stored in TLD (so it doesn't go out of scope)
     t.segments = segment_mod.SegmentsTLD.init(t.os_allocator.allocator());
+    t.segments.subproc = &global_subproc;
     t.heap_backing = &heap_mod.heap_main;
     heap_mod.heap_main.tld = t;
     heap_mod.heap_main.thread_id = std.Thread.getCurrentId();
 }
-
-// =============================================================================
-// Fast Path Allocation
-// =============================================================================
 
 /// Fast path for small allocations (inlined)
 inline fn mallocSmallFast(heap: *Heap, size: usize) ?[*]u8 {
@@ -141,30 +151,38 @@ inline fn mallocGeneric(heap: *Heap, size: usize, zero: bool) ?[*]u8 {
     const bin = page_mod.binFromSize(size);
     const block_size = page_mod.blockSizeForBin(bin);
 
-    // Get or create a page
-    const page = t.segments.allocPage(block_size) orelse return null;
+    // Try to get a page, reclaim abandoned segments if needed
+    var page = t.segments.allocPage(block_size);
+    if (page == null) {
+        // Try to reclaim abandoned segments from other threads
+        if (global_subproc.abandoned_count.load(.monotonic) > 0) {
+            _ = reclaimAbandoned(ABANDON_RECLAIM_LIMIT);
+            page = t.segments.allocPage(block_size);
+        }
+    }
+    const pg = page orelse return null;
 
     // Initialize page if not yet initialized (page_start is null)
-    if (page.page_start == null) {
-        const segment = Segment.fromPtr(page);
+    if (pg.page_start == null) {
+        const segment = Segment.fromPtr(pg);
         assert(@intFromPtr(segment) % types.SEGMENT_SIZE == 0);
         var page_size: usize = undefined;
-        const page_start = segment.pageStart(page, &page_size);
-        page.init(block_size, page_start, page_size);
+        const page_start = segment.pageStart(pg, &page_size);
+        pg.init(block_size, page_start, page_size);
     }
 
     // Extend free list if needed
-    if (page.free.empty() and page.reserved < page.capacity) {
-        const extend = @min(16, page.capacity - page.reserved);
-        page.extendFree(extend);
+    if (pg.free.empty() and pg.reserved < pg.capacity) {
+        const extend = @min(16, pg.capacity - pg.reserved);
+        pg.extendFree(extend);
     }
 
     // Get block
-    const block = page.popFreeBlock() orelse return null;
+    const block = pg.popFreeBlock() orelse return null;
     const ptr: [*]u8 = @ptrCast(block);
 
     if (types.DEBUG) {
-        const page_segment = Segment.fromPtr(page);
+        const page_segment = Segment.fromPtr(pg);
         const ptr_segment = Segment.fromPtr(ptr);
         assert(ptr_segment == page_segment);
     }
@@ -176,14 +194,14 @@ inline fn mallocGeneric(heap: *Heap, size: usize, zero: bool) ?[*]u8 {
 
     // Add page to heap queue if not already there
     // Use in_bin flag to track queue membership
-    if (bin < heap.pages.len and !page.flags.page_flags.in_bin) {
-        page.set_in_full(false);
-        page.pagePushBin(heap, bin);
+    if (bin < heap.pages.len and !pg.flags.page_flags.in_bin) {
+        pg.set_in_full(false);
+        pg.pagePushBin(heap, bin);
     }
 
     // Update direct pointer for the block_size's wsize
     // Other wsizes in the bin will use mallocMedium's bin queue lookup
-    setDirectPointerForBlockSize(heap, page);
+    setDirectPointerForBlockSize(heap, pg);
 
     return ptr;
 }
@@ -552,6 +570,118 @@ pub fn collect(force: bool) usize {
     }
 
     return collected;
+}
+
+/// Called when a thread is about to exit
+/// Abandons all segments owned by this thread so other threads can reclaim them
+pub fn threadExit() void {
+    if (!tld_initialized) return;
+
+    const current_thread = std.Thread.getCurrentId();
+    const heap = &heap_mod.heap_main;
+
+    // Clear all direct pointers
+    for (&heap.pages_free_direct) |*direct| {
+        direct.* = null;
+    }
+
+    // Clear all bin queues and mark pages as not in bin
+    for (&heap.pages) |*pq| {
+        while (pq.tail) |pg| {
+            const prev = pg.prev;
+            pg.flags.page_flags.in_bin = false;
+            pg.next = null;
+            pg.prev = null;
+            pq.tail = prev;
+            if (prev) |p| p.next = null;
+        }
+    }
+
+    // Abandon all segments owned by this thread
+    var segments_to_abandon: [64]*Segment = undefined;
+    var abandon_count: usize = 0;
+
+    // Collect segments from free queues
+    inline for ([_]*segment_mod.SegmentQueue{ &tld.segments.small_free, &tld.segments.medium_free }) |q| {
+        while (q.pop()) |seg| {
+            if (seg.thread_id.load(.acquire) == current_thread) {
+                if (abandon_count < segments_to_abandon.len) {
+                    segments_to_abandon[abandon_count] = seg;
+                    abandon_count += 1;
+                }
+            }
+        }
+    }
+
+    // Add abandoned segments to global queue
+    if (abandon_count > 0) {
+        global_subproc.abandoned_os_lock.lock();
+        defer global_subproc.abandoned_os_lock.unlock();
+
+        for (segments_to_abandon[0..abandon_count]) |seg| {
+            seg.markAbandoned();
+            global_subproc.abandoned_os_list.push(seg);
+            _ = global_subproc.abandoned_os_list_count.fetchAdd(1, .monotonic);
+        }
+        _ = global_subproc.abandoned_count.fetchAdd(abandon_count, .monotonic);
+    }
+
+    // Mark TLD as uninitialized
+    tld_initialized = false;
+    _ = active_thread_count.fetchSub(1, .monotonic);
+
+    // Clear heap reference
+    heap.tld = null;
+}
+
+/// Try to reclaim abandoned segments from other threads
+/// Called automatically during allocation when there are abandoned segments
+/// Returns number of segments reclaimed
+pub fn reclaimAbandoned(max_count: usize) usize {
+    if (!tld_initialized) return 0;
+
+    const count = global_subproc.abandoned_os_list_count.load(.monotonic);
+    if (count == 0) return 0;
+
+    // Try to acquire visit lock (non-blocking)
+    if (!global_subproc.abandoned_os_visit_lock.trylock()) {
+        return 0;
+    }
+    defer global_subproc.abandoned_os_visit_lock.unlock();
+
+    var reclaimed: usize = 0;
+    const current_thread = std.Thread.getCurrentId();
+
+    global_subproc.abandoned_os_lock.lock();
+
+    var seg = global_subproc.abandoned_os_list.head;
+    while (seg != null and reclaimed < max_count) {
+        const next = seg.?.abandoned_os_next;
+
+        if (seg.?.tryReclaim(current_thread)) {
+            // Remove from abandoned list
+            global_subproc.abandoned_os_list.remove(seg.?);
+            _ = global_subproc.abandoned_os_list_count.fetchSub(1, .monotonic);
+            _ = global_subproc.abandoned_count.fetchSub(1, .monotonic);
+
+            // Add to our free queue
+            seg.?.was_reclaimed = true;
+            tld.segments.insertInFreeQueue(seg.?);
+            tld.segments.reclaim_count += 1;
+
+            reclaimed += 1;
+        }
+
+        seg = next;
+    }
+
+    global_subproc.abandoned_os_lock.unlock();
+    return reclaimed;
+}
+
+/// Get count of abandoned segments waiting to be reclaimed
+pub fn getAbandonedCount() usize {
+    return global_subproc.abandoned_count.load(.monotonic);
 }
 
 /// Get memory statistics
