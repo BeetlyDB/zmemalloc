@@ -11,7 +11,7 @@ pub const Heap = struct {
     _: void align(std.atomic.cache_line) = {},
     tld: ?*tld.TLD = null,
     thread_delayed_free: Atomic(?*page.Block) = .init(null), // atomic cross-thread delayed free list
-    thread_id: std.Thread.Id = 0,
+    thread_id: usize = 0, // TLD address for fast thread check
     arena_id: usize = 0,
     page_count: usize = 0,
     page_retired_min: usize = 0,
@@ -55,15 +55,13 @@ pub threadlocal var heap_main: Heap = heap_empty;
 pub threadlocal var heap_default: *const Heap = (&heap_empty);
 pub threadlocal var heap_backing: *Heap = &heap_main;
 
-pub inline fn init_main_heap() void {
-    heap_main.thread_id = std.Thread.getCurrentId();
-}
+// init_main_heap is handled by root.zig initTld now
 
 pub fn main_get_heap() *Heap {
-    std.once(init_main_heap());
     return &heap_main;
 }
 
 pub fn is_heap_main_thread() bool {
-    return heap_main.thread_id == std.Thread.getCurrentId() and heap_main.thread_id != 0;
+    // This is now checked via TLD address comparison in free path
+    return heap_main.thread_id != 0;
 }

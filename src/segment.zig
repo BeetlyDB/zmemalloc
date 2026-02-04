@@ -52,9 +52,11 @@ pub const Segment = struct {
     abandoned_os_prev: ?*Self = null,
 
     // Layout optimized for free() access - cache line aligned
-    thread_id: Atomic(std.Thread.Id) align(std.atomic.cache_line) = .init(0),
+    // Use usize for thread_id to allow TLD address (faster than syscall)
+    thread_id: Atomic(usize) align(std.atomic.cache_line) = .init(0),
     page_shift: usize = 0,
     page_kind: PageKind = .small,
+    header_slices: usize = 0, // Pre-computed for fast pageFromPtr
     pages: [types.SLICES_PER_SEGMENT]Page = undefined,
 
     pub const PageKind = enum(u8) {
@@ -68,14 +70,14 @@ pub const Segment = struct {
     // Size Calculations
     // =========================================================================
 
-    pub fn pageSize(self: *const Self) usize {
+    pub inline fn pageSize(self: *const Self) usize {
         return if (self.capacity > 1)
             @as(usize, 1) << @intCast(self.page_shift)
         else
             self.segment_size;
     }
 
-    pub fn rawPageSize(self: *const Self) usize {
+    pub inline fn rawPageSize(self: *const Self) usize {
         return if (self.page_kind == .huge)
             self.segment_size
         else
@@ -83,7 +85,7 @@ pub const Segment = struct {
     }
 
     /// Get raw start of page memory
-    pub fn rawPageStart(self: *const Self, pg: *const Page, page_size_out: ?*usize) [*]u8 {
+    pub inline fn rawPageStart(self: *const Self, pg: *const Page, page_size_out: ?*usize) [*]u8 {
         const psize_raw = self.rawPageSize();
         const base: [*]u8 = @ptrFromInt(@intFromPtr(self));
 
@@ -125,30 +127,17 @@ pub const Segment = struct {
         return @ptrFromInt(@intFromPtr(p) & ~types.SEGMENT_MASK);
     }
 
-    /// Get page from pointer (within segment's data area)
+    /// Get page from pointer (within segment's data area) - optimized
     pub inline fn pageFromPtr(p: *const anyopaque) *Page {
-        const segment = fromPtr(p);
+        return pageFromPtrWithSegment(fromPtr(p), p);
+    }
+
+    /// Get page when segment is already known (avoids duplicate lookup)
+    pub inline fn pageFromPtrWithSegment(segment: *Self, p: *const anyopaque) *Page {
         const diff = @intFromPtr(p) - @intFromPtr(segment);
-
-        // Validate segment looks reasonable
-        assert(segment.page_shift >= types.SMALL_PAGE_SHIFT);
-        assert(segment.page_shift <= types.SEGMENT_SHIFT);
-        assert(segment.capacity > 0);
-        assert(segment.capacity <= types.SLICES_PER_SEGMENT);
-
         const shift: u6 = @intCast(segment.page_shift);
         const slice_idx = diff >> shift;
-
-        // Calculate header slices and adjust
-        const page_size = @as(usize, 1) << shift;
-        const header_slices = (segment.segment_info_size + page_size - 1) / page_size;
-
-        // Page index is slice index minus header slices
-        const page_idx = slice_idx -| header_slices;
-
-        // Validate page index
-        assert(page_idx < segment.capacity);
-
+        const page_idx = slice_idx -| segment.header_slices;
         return &segment.pages[page_idx];
     }
 
@@ -185,7 +174,7 @@ pub const Segment = struct {
         return true;
     }
 
-    pub fn pageClear(self: *Self, pg: *Page) void {
+    pub inline fn pageClear(self: *Self, pg: *Page) void {
         pg.segment_in_use = false;
         pg.flags.page_flags = .{};
         pg.local_free = .init();
@@ -222,10 +211,6 @@ pub const Segment = struct {
         }
         return null;
     }
-
-    // =========================================================================
-    // Static Methods
-    // =========================================================================
 
     pub inline fn calculateSizes(capacity: usize, required: usize) struct { segment_size: usize, info_size: usize } {
         _ = capacity; // Capacity is already accounted for in @sizeOf(Segment)
@@ -272,7 +257,7 @@ pub const Segment = struct {
     }
 
     /// Try to reclaim this segment for the current thread
-    pub inline fn tryReclaim(self: *Self, thread_id: std.Thread.Id) bool {
+    pub inline fn tryReclaim(self: *Self, thread_id: usize) bool {
         // Try to atomically claim the segment
         const old = self.thread_id.cmpxchgStrong(
             0, // expected: abandoned
@@ -427,6 +412,9 @@ pub const SegmentsTLD = struct {
 
     os_alloc: std.mem.Allocator = undefined,
 
+    // Fast thread ID (TLD address) - set during init, avoids syscall
+    thread_id: usize = 0,
+
     // =========================================================================
     // Initialization
     // =========================================================================
@@ -439,7 +427,7 @@ pub const SegmentsTLD = struct {
     // Queue Management
     // =========================================================================
 
-    pub fn freeQueueOfKind(self: *Self, kind: Segment.PageKind) ?*SegmentQueue {
+    pub inline fn freeQueueOfKind(self: *Self, kind: Segment.PageKind) ?*SegmentQueue {
         return switch (kind) {
             .small => &self.small_free,
             .medium => &self.medium_free,
@@ -451,14 +439,14 @@ pub const SegmentsTLD = struct {
         return self.freeQueueOfKind(segment.page_kind);
     }
 
-    pub fn removeFromFreeQueue(self: *Self, segment: *Segment) void {
+    pub inline fn removeFromFreeQueue(self: *Self, segment: *Segment) void {
         const q = self.freeQueue(segment) orelse return;
         if (q.hasItem(segment)) {
             q.remove(segment);
         }
     }
 
-    pub fn insertInFreeQueue(self: *Self, segment: *Segment) void {
+    pub inline fn insertInFreeQueue(self: *Self, segment: *Segment) void {
         const q = self.freeQueue(segment) orelse return;
         q.push(segment);
     }
@@ -467,7 +455,7 @@ pub const SegmentsTLD = struct {
     // Tracking
     // =========================================================================
 
-    pub fn trackSize(self: *Self, segment_size: isize) void {
+    pub inline fn trackSize(self: *Self, segment_size: isize) void {
         if (segment_size >= 0) {
             self.count += 1;
             self.current_size += @intCast(segment_size);
@@ -559,6 +547,10 @@ pub const SegmentsTLD = struct {
         capacity: usize,
     ) *Segment {
         const segment: *Segment = @ptrCast(@alignCast(raw_ptr));
+        // Pre-compute header_slices for fast pageFromPtr
+        const page_size_local = @as(usize, 1) << @as(u6, @intCast(page_shift));
+        const header_slices = (info_size + page_size_local - 1) / page_size_local;
+
         segment.* = .{
             .memid = mem_id,
             .allow_decommit = !mem_id.flags.is_pinned,
@@ -567,10 +559,11 @@ pub const SegmentsTLD = struct {
             .segment_info_size = info_size,
             .page_kind = page_kind,
             .page_shift = page_shift,
+            .header_slices = header_slices,
             .capacity = capacity,
         };
 
-        segment.thread_id.store(std.Thread.getCurrentId(), .release);
+        segment.thread_id.store(self.thread_id, .release);
 
         // Initialize pages
         for (0..capacity) |i| {
@@ -628,7 +621,7 @@ pub const SegmentsTLD = struct {
     // Page Allocation
     // =========================================================================
 
-    pub fn freePage(self: *Self, pg: *Page, force: bool) void {
+    pub inline fn freePage(self: *Self, pg: *Page, force: bool) void {
         const segment = Segment.fromPtr(pg);
         segment.pageClear(pg);
         segment.used -= 1;
@@ -775,9 +768,7 @@ pub const SegmentsTLD = struct {
 
     /// Try to reclaim an abandoned segment
     pub fn tryReclaimSegment(self: *Self, segment: *Segment) bool {
-        const thread_id = std.Thread.getCurrentId();
-
-        if (!segment.tryReclaim(thread_id)) {
+        if (!segment.tryReclaim(self.thread_id)) {
             return false;
         }
 

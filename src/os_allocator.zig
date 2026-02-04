@@ -30,7 +30,10 @@ pub fn allocator(self: *OsAllocator) Allocator {
 
 pub inline fn map(self: *const OsAllocator, n: usize, alignment: mem.Alignment) ?[*]u8 {
     const page_size = self.config.page_size;
-    if (n >= maxInt(usize) - page_size) return null;
+    if (n >= maxInt(usize) - page_size) {
+        @branchHint(.cold);
+        return null;
+    }
     const alignment_bytes = alignment.toByteUnits();
 
     const aligned_len = utils.alignForward(usize, n, page_size);

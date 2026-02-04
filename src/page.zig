@@ -84,7 +84,6 @@ pub const Page = struct {
     page_start: ?[*]u8 = null,
 
     xthread_free: Atomic(?*Block) = .init(null), // cross-thread free list (atomic)
-    xheap: Atomic(?*heap.Heap) = .init(null),
 
     // intrusive linked list for page queues
     next: ?*Page = null, // next page owned by this thread with the same `block_size`
@@ -212,7 +211,7 @@ pub const Page = struct {
         while (i > 0) : (i -= 1) {
             const block: *Block = @ptrCast(@alignCast(block_start + (i - 1) * bsize));
             // Initialize link before pushing (memory may contain garbage)
-            block.link = .{};
+            // block.link = .{};
             self.free.push(block);
         }
 
@@ -237,7 +236,7 @@ pub const Page = struct {
     }
 
     /// Collect thread-local free list into main free list
-    pub fn collectLocalFree(self: *Self) void {
+    pub inline fn collectLocalFree(self: *Self) void {
         // Move all from local_free to free
         while (self.local_free.pop()) |block| {
             self.free.push(block);
@@ -245,7 +244,7 @@ pub const Page = struct {
     }
 
     /// Collect cross-thread free list (atomic)
-    pub fn collectXthreadFree(self: *Self) usize {
+    pub inline fn collectXthreadFree(self: *Self) usize {
         var head = self.xthread_free.swap(null, .acq_rel);
         var count: usize = 0;
 
@@ -272,14 +271,14 @@ pub const Page = struct {
     }
 
     /// Collect all free lists
-    pub fn freeCollect(self: *Self, force: bool) void {
+    pub inline fn freeCollect(self: *Self, force: bool) void {
         _ = force;
         self.collectLocalFree();
         _ = self.collectXthreadFree();
     }
 
     /// Free a block from another thread (lock-free)
-    pub fn xthreadFree(self: *Self, block: *Block) void {
+    pub inline fn xthreadFree(self: *Self, block: *Block) void {
         while (true) {
             const old_head = self.xthread_free.load(.acquire);
             // Store old_head's link pointer (convert Block* to Link*)
@@ -297,38 +296,44 @@ pub const Page = struct {
         }
     }
 
-    /// Pop a free block for allocation
+    /// Pop a free block - hot path
     pub inline fn popFreeBlock(self: *Self) ?*Block {
-        assert(self.page_start != null);
-        assert(self.block_size > 0);
-        assert(self.used <= self.capacity);
-        // First try local free list (most common case after same-thread free)
-        if (self.local_free.pop()) |block| {
-            self.used += 1;
-            return block;
-        }
-
-        // Try main free list (from extendFree or collected xthread)
+        // Hot path: pop from free list
         if (self.free.pop()) |block| {
             self.used += 1;
             return block;
         }
 
-        // Try to collect xthread free (from other threads)
-        if (self.collectXthreadFree() > 0) {
+        // Cold path: collect local_free into free, then retry
+        return self.popFreeBlockSlow();
+    }
+
+    inline fn popFreeBlockSlow(self: *Self) ?*Block {
+        // Move local_free to free
+        if (!self.local_free.empty()) {
+            // Swap the lists - local_free becomes new free
+            const temp = self.free;
+            self.free = self.local_free;
+            self.local_free = temp;
+
             if (self.free.pop()) |block| {
                 self.used += 1;
                 return block;
             }
         }
 
+        // Try to collect xthread free
+        if (self.collectXthreadFree() > 0) {
+            if (self.free.pop()) |block| {
+                self.used += 1;
+                return block;
+            }
+        }
         return null;
     }
 
-    /// Push a freed block (same thread)
-    pub fn pushFreeBlock(self: *Self, block: *Block) void {
-        // Initialize link before pushing (user may have overwritten this memory)
-        block.link = .{};
+    /// Push freed block to local_free (write path separate from read path)
+    pub inline fn pushFreeBlock(self: *Self, block: *Block) void {
         self.local_free.push(block);
         self.used -|= 1;
     }

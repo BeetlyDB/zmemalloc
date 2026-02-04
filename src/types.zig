@@ -121,7 +121,7 @@ pub const PADDING_WSIZE: usize = if (DEBUG) 2 else 0;
 pub const PAGES_DIRECT: usize = SMALL_WSIZE_MAX + 1;
 
 /// Number of size class bins (excluding huge)
-pub const BIN_HUGE: usize = 127;
+pub const BIN_HUGE: usize = 73;
 
 /// Total bins including full pages bin
 pub const BIN_FULL: usize = BIN_HUGE + 1;

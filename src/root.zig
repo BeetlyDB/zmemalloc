@@ -18,7 +18,7 @@ const Segment = segment_mod.Segment;
 const TLD = tld_mod.TLD;
 const SegmentAbandonedQueue = segment_mod.SegmentAbandonedQueue;
 
-const RETIRE_CYCLES: u8 = 128;
+const RETIRE_CYCLES: u8 = 16;
 const MAX_SCAN_PAGES = 8;
 const COLLECT_INTERVAL: usize = 512;
 const ABANDON_RECLAIM_LIMIT: usize = 8; // Max segments to reclaim per allocation
@@ -40,42 +40,46 @@ var active_thread_count: Atomic(usize) = .init(0);
 threadlocal var tld: TLD = .{};
 threadlocal var tld_initialized: bool = false;
 threadlocal var alloc_counter: usize = 0;
+// Direct heap pointer for faster access in hot path
+threadlocal var cached_heap: ?*Heap = null;
 
 inline fn ensureTldInitialized() *TLD {
     if (!tld_initialized) {
+        @branchHint(.cold);
         initTld(&tld);
         tld_initialized = true;
+        cached_heap = tld.heap_backing;
         _ = active_thread_count.fetchAdd(1, .monotonic);
     }
     return &tld;
 }
 
-inline fn initTld(t: *TLD) void {
-    t.segments = segment_mod.SegmentsTLD.init(t.os_allocator.allocator());
-    t.segments.subproc = &global_subproc;
-    t.heap_backing = &heap_mod.heap_main;
-    heap_mod.heap_main.tld = t;
-    heap_mod.heap_main.thread_id = std.Thread.getCurrentId();
+/// Get heap for fast path - single threadlocal access
+inline fn getHeapFast() ?*Heap {
+    return cached_heap;
 }
 
-/// Fast path for small allocations (inlined)
+inline fn initTld(t: *TLD) void {
+    // Use TLD address as thread ID - fast, no syscall
+    const thread_id = @intFromPtr(t);
+
+    t.segments = segment_mod.SegmentsTLD.init(t.os_allocator.allocator());
+    t.segments.subproc = &global_subproc;
+    t.segments.thread_id = thread_id; // For segment creation
+    t.heap_backing = &heap_mod.heap_main;
+    heap_mod.heap_main.tld = t;
+    heap_mod.heap_main.thread_id = thread_id;
+}
+
+/// Fast path for small allocations (inlined, minimal ops)
 inline fn mallocSmallFast(heap: *Heap, size: usize) ?[*]u8 {
-    assert(size <= types.SMALL_OBJ_SIZE_MAX);
-
-    // Get word size (rounded up)
     const wsize = (size + types.INTPTR_SIZE - 1) / types.INTPTR_SIZE;
-    assert(wsize <= types.SMALL_WSIZE_MAX);
-
-    // Direct page lookup for small sizes
     const page = heap.pages_free_direct[wsize] orelse return null;
 
-    // Try to get block from page
     const block = page.popFreeBlock() orelse {
         heap.pages_free_direct[wsize] = null;
         return null;
     };
-    // Reset retire counter - page is being used
-    page.retire_expire = 0;
 
     return @ptrCast(block);
 }
@@ -83,22 +87,13 @@ inline fn mallocSmallFast(heap: *Heap, size: usize) ?[*]u8 {
 /// Medium allocation path
 inline fn mallocMedium(heap: *Heap, size: usize) ?[*]u8 {
     const bin = page_mod.binFromSize(size);
-    assert(bin <= types.BIN_HUGE);
-
     const pq = &heap.pages[bin];
 
-    // Fast path: check only the first page (tail) - O(1)
-    // All pages in this bin have the same block_size = blockSizeForBin(bin)
     if (pq.tail) |pg| {
-        @branchHint(.likely);
         if (pg.popFreeBlock()) |block| {
-            // Reset retire counter - page is being used
-            pg.retire_expire = 0;
-            // If page is now full, remove from queue and mark as full
             if (!pg.hasFree()) {
                 pg.pageRemoveFromBin(heap, bin);
                 pg.set_in_full(true);
-                // Clear direct pointers since page is full
                 clearDirectPointersForPage(heap, pg);
             }
             return @ptrCast(block);
@@ -164,6 +159,7 @@ inline fn mallocGeneric(heap: *Heap, size: usize, zero: bool) ?[*]u8 {
 
     // Initialize page if not yet initialized (page_start is null)
     if (pg.page_start == null) {
+        @branchHint(.cold);
         const segment = Segment.fromPtr(pg);
         assert(@intFromPtr(segment) % types.SEGMENT_SIZE == 0);
         var page_size: usize = undefined;
@@ -173,6 +169,7 @@ inline fn mallocGeneric(heap: *Heap, size: usize, zero: bool) ?[*]u8 {
 
     // Extend free list if needed
     if (pg.free.empty() and pg.reserved < pg.capacity) {
+        @branchHint(.cold);
         const extend = @min(16, pg.capacity - pg.reserved);
         pg.extendFree(extend);
     }
@@ -189,6 +186,7 @@ inline fn mallocGeneric(heap: *Heap, size: usize, zero: bool) ?[*]u8 {
 
     // Zero if requested
     if (zero) {
+        @branchHint(.unlikely);
         @memset(ptr[0..block_size], 0);
     }
 
@@ -235,61 +233,46 @@ inline fn retirePage(page: *Page) void {
     tld.segments.freePage(page, false);
 }
 
-/// Free memory
+/// Get fast thread ID - uses TLD address (unique per thread, no syscall)
+inline fn fastThreadId() usize {
+    return @intFromPtr(&tld);
+}
+
+/// Cold path for free - handle full page becoming non-full
+inline fn freeColdPath(page: *Page) void {
+    page.set_in_full(false);
+    const heap = &heap_mod.heap_main;
+    const bin = page_mod.binFromSize(page.block_size);
+    if (bin < heap.pages.len) {
+        page.pagePushBin(heap, bin);
+        setDirectPointerForBlockSize(heap, page);
+    }
+}
+
+/// Free memory - minimal hot path
 inline fn freeImpl(ptr: ?*anyopaque) void {
     const p = ptr orelse return;
 
-    // Get segment and page from pointer
+    // Single segment lookup
     const segment = Segment.fromPtr(p);
-    const page = Segment.pageFromPtr(p);
-
-    // Check if same thread
-    const current_thread = std.Thread.getCurrentId();
-    const page_thread = segment.thread_id.load(.acquire);
-
+    const page = Segment.pageFromPtrWithSegment(segment, p);
     const block: *Block = @ptrCast(@alignCast(p));
 
-    if (page_thread == current_thread) {
+    // Fast thread check
+    const page_thread = segment.thread_id.load(.monotonic);
+
+    if (page_thread == fastThreadId()) {
         @branchHint(.likely);
-        // Check if page was marked as full (not in queue)
-        const was_full = page.is_in_full();
-
-        // Same thread - fast path
+        // Hot path: just push to free list
         page.pushFreeBlock(block);
-
-        // If page was full, add back to heap queue first
-        if (was_full and tld_initialized and page.block_size > 0) {
-            page.set_in_full(false);
-            const heap = &heap_mod.heap_main;
-            const bin = page_mod.binFromSize(page.block_size);
-            if (bin < heap.pages.len) {
-                page.pagePushBin(heap, bin);
-                // Update direct pointer so fast path can use this page
-                setDirectPointerForBlockSize(heap, page);
-            }
-        }
-
-        // Check if page is completely empty - retire if there are other pages in the bin
-        if (page.used == 0 and page.capacity > 0 and tld_initialized) {
-            @branchHint(.unlikely);
-            const heap = &heap_mod.heap_main;
-            const bin = page_mod.binFromSize(page.block_size);
-
-            if (bin < heap.pages.len) {
-                const pq = &heap.pages[bin];
-                // Only retire if there are OTHER pages in the queue
-                // This keeps at least one page per bin for fast reallocation
-                if (!(pq.tail == page and page.prev == null)) {
-                    // Multiple pages in queue - retire this empty one immediately
-                    retirePage(page);
-                }
-                // If sole page in queue, keep it - it will be reused on next alloc
-                // The collectRetired will handle cleanup if it stays empty too long
-            }
+        // Cold path: handle full page transition
+        if (page.is_in_full()) {
+            @branchHint(.cold);
+            freeColdPath(page);
         }
     } else if (page_thread == 0) {
         @branchHint(.likely);
-        // Abandoned segment - just push to local free
+        // Abandoned page - push to free list
         page.pushFreeBlock(block);
     } else {
         @branchHint(.unlikely);
@@ -394,32 +377,28 @@ pub fn malloc(size: usize) ?[*]u8 {
         return null;
     }
 
-    const t = ensureTldInitialized();
-    const heap = t.heap_backing orelse return null;
+    // Ensure TLD initialized (just bool check after first call)
+    _ = ensureTldInitialized();
+    const heap = cached_heap orelse return null;
 
-    // Fast path for small allocations (only for sizes that fit in direct lookup)
+    // Fast path for small allocations
     if (size <= MAX_FAST_SIZE) {
         if (mallocSmallFast(heap, size)) |ptr| {
-            @branchHint(.likely);
             return ptr;
         }
-        // Try medium path (bin queue) before falling back to generic
         if (mallocMedium(heap, size)) |ptr| {
             return ptr;
         }
-        // Fall through to slow path
         return mallocGeneric(heap, size, false);
     }
 
-    // Medium path (larger objects)
+    // Medium/large path
     if (size <= types.MEDIUM_OBJ_SIZE_MAX) {
-        @branchHint(.likely);
         if (mallocMedium(heap, size)) |ptr| {
             return ptr;
         }
     }
 
-    // Slow path
     return mallocGeneric(heap, size, false);
 }
 

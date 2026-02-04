@@ -509,8 +509,15 @@ pub fn IntrusiveLifo(comptime T: type) type {
             return .{ .any = .{} };
         }
 
-        pub inline fn count(self: *Self) u64 {
-            return self.any.count;
+        /// O(n) count - only use for debugging
+        pub fn count(self: *const Self) u64 {
+            var n: u64 = 0;
+            var next = self.any.head;
+            while (next) |link| {
+                n += 1;
+                next = link.next;
+            }
+            return n;
         }
 
         /// Pushes a new node to the first position of the Stack.
@@ -580,29 +587,20 @@ pub fn IntrusiveLifo(comptime T: type) type {
 //     C.next = null
 //     pop() → C
 // head → A → B → null
+/// Optimized LIFO - minimal operations for hot path
 const IntrusiveLifoAny = struct {
     head: ?*IntrusiveLifoLink = null,
 
-    count: u64 = 0,
     const Self = @This();
 
     inline fn push(self: *Self, link: *IntrusiveLifoLink) void {
-        assert((self.count == 0) == (self.head == null));
-        assert(link.next == null);
-
-        // Insert the new element at the head.
         link.next = self.head;
         self.head = link;
-        self.count += 1;
     }
 
     inline fn pop(self: *Self) ?*IntrusiveLifoLink {
-        assert((self.count == 0) == (self.head == null));
-
         const link = self.head orelse return null;
         self.head = link.next;
-        link.next = null;
-        self.count -= 1;
         return link;
     }
 
@@ -611,17 +609,16 @@ const IntrusiveLifoAny = struct {
     }
 
     inline fn empty(self: *const Self) bool {
-        assert((self.count == 0) == (self.head == null));
         return self.head == null;
     }
 
-    inline fn contains(self: *const Self, needle: *const IntrusiveLifoLink) bool {
+    fn contains(self: *const Self, needle: *const IntrusiveLifoLink) bool {
         var next = self.head;
-        for (0..self.count + 1) |_| {
-            const link = next orelse return false;
+        while (next) |link| {
             if (link == needle) return true;
             next = link.next;
-        } else unreachable;
+        }
+        return false;
     }
 };
 
