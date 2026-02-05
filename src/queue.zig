@@ -32,7 +32,7 @@ pub fn Intrusive(
         count: u64 = 0,
 
         /// Enqueue a new element to the back of the queue.
-        pub fn push(self: *Self, v: *Node) void {
+        pub inline fn push(self: *Self, v: *Node) void {
             assert(@field(v, next_field) == null);
             assert(@field(v, prev_field) == null);
             if (self.tail) |tail| {
@@ -49,7 +49,7 @@ pub fn Intrusive(
         }
 
         /// Dequeue the next element from the queue.
-        pub fn pop(self: *Self) ?*Node {
+        pub inline fn pop(self: *Self) ?*Node {
             assert(self.count > 0);
             // The next element is in "head".
             const next = self.head orelse return null;
@@ -72,12 +72,12 @@ pub fn Intrusive(
         }
 
         /// Returns true if the queue is empty.
-        pub fn empty(self: *const Self) bool {
+        pub inline fn empty(self: *const Self) bool {
             return self.head == null;
         }
 
         /// Removes the item from the queue. Asserts that Queue contains the item
-        pub fn remove(self: *Self, item: *Node) void {
+        pub inline fn remove(self: *Self, item: *Node) void {
             assert(self.hasItem(item));
             assert(self.count > 0);
             const prev = @field(item, prev_field);
@@ -99,7 +99,7 @@ pub fn Intrusive(
             @field(item, prev_field) = null;
         }
 
-        pub fn hasItem(self: *const Self, item: *Node) bool {
+        pub inline fn hasItem(self: *const Self, item: *Node) bool {
             var maybe_node = self.head;
             while (maybe_node) |node| {
                 if (node == item) return true;
@@ -208,6 +208,8 @@ pub fn DoublyLinkedListType(
             assert(@field(node, field_back) == null);
             assert(@field(node, field_next) == null);
 
+            @prefetch(node, .{ .cache = .data, .locality = 3, .rw = .read });
+
             if (list.tail) |tail| {
                 assert(list.count > 0);
                 assert(@field(tail, field_next) == null);
@@ -226,6 +228,10 @@ pub fn DoublyLinkedListType(
             if (list.tail) |tail_old| {
                 assert(list.count > 0);
                 assert(@field(tail_old, field_next) == null);
+
+                if (@field(tail_old, field_back)) |prev| {
+                    @prefetch(prev, .{ .cache = .data, .locality = 3, .rw = .read });
+                }
 
                 list.tail = @field(tail_old, field_back);
                 list.count -= 1;
@@ -370,7 +376,7 @@ const QueueAny = struct {
     out: ?*QueueLink = null,
     count: u64 = 0,
 
-    pub fn push(self: *QueueAny, link: *QueueLink) void {
+    pub inline fn push(self: *QueueAny, link: *QueueLink) void {
         assert(link.next == null);
         if (self.in) |in| {
             in.next = link;
@@ -383,7 +389,7 @@ const QueueAny = struct {
         self.count += 1;
     }
 
-    pub fn pop(self: *QueueAny) ?*QueueLink {
+    pub inline fn pop(self: *QueueAny) ?*QueueLink {
         const result = self.out orelse return null;
         self.out = result.next;
         result.next = null;
@@ -392,19 +398,19 @@ const QueueAny = struct {
         return result;
     }
 
-    pub fn peek_last(self: *const QueueAny) ?*QueueLink {
+    pub inline fn peek_last(self: *const QueueAny) ?*QueueLink {
         return self.in;
     }
 
-    pub fn peek(self: *const QueueAny) ?*QueueLink {
+    pub inline fn peek(self: *const QueueAny) ?*QueueLink {
         return self.out;
     }
 
-    pub fn empty(self: *const QueueAny) bool {
+    pub inline fn empty(self: *const QueueAny) bool {
         return self.peek() == null;
     }
 
-    pub fn contains(self: *const QueueAny, needle: *const QueueLink) bool {
+    pub inline fn contains(self: *const QueueAny, needle: *const QueueLink) bool {
         var iterator = self.peek();
         while (iterator) |link| : (iterator = link.next) {
             if (link == needle) return true;
@@ -412,7 +418,7 @@ const QueueAny = struct {
         return false;
     }
 
-    pub fn remove(self: *QueueAny, to_remove: *QueueLink) void {
+    pub inline fn remove(self: *QueueAny, to_remove: *QueueLink) void {
         if (to_remove == self.out) {
             _ = self.pop();
             return;
@@ -429,11 +435,11 @@ const QueueAny = struct {
         } else unreachable;
     }
 
-    pub fn reset(self: *QueueAny) void {
+    pub inline fn reset(self: *QueueAny) void {
         self.* = .{};
     }
 
-    pub fn iterate(self: *const QueueAny) Iterator {
+    pub inline fn iterate(self: *const QueueAny) Iterator {
         return .{
             .head = self.out,
         };
@@ -510,7 +516,7 @@ pub fn IntrusiveLifo(comptime T: type) type {
         }
 
         /// O(n) count - only use for debugging
-        pub fn count(self: *const Self) u64 {
+        pub inline fn count(self: *const Self) u64 {
             var n: u64 = 0;
             var next = self.any.head;
             while (next) |link| {
@@ -595,12 +601,16 @@ const IntrusiveLifoAny = struct {
 
     inline fn push(self: *Self, link: *IntrusiveLifoLink) void {
         link.next = self.head;
+        @prefetch(link.next, .{ .cache = .data, .locality = 3, .rw = .read });
         self.head = link;
     }
 
     inline fn pop(self: *Self) ?*IntrusiveLifoLink {
         const link = self.head orelse return null;
         self.head = link.next;
+        if (link.next) |next_link| {
+            @prefetch(next_link, .{ .cache = .data, .locality = 3, .rw = .read });
+        }
         return link;
     }
 
@@ -612,7 +622,7 @@ const IntrusiveLifoAny = struct {
         return self.head == null;
     }
 
-    fn contains(self: *const Self, needle: *const IntrusiveLifoLink) bool {
+    inline fn contains(self: *const Self, needle: *const IntrusiveLifoLink) bool {
         var next = self.head;
         while (next) |link| {
             if (link == needle) return true;

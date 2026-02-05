@@ -10,15 +10,13 @@ pub fn main() !void {
     std.debug.print("Pattern: alloc {}, free random half, alloc again, free all\n", .{num_ptrs});
     std.debug.print("Iterations: {}\n\n", .{iterations});
 
-    var prng = std.Random.DefaultPrng.init(12345);
-    const random = prng.random();
-
     // zmemalloc
 
     // smp_allocator
     const smp_time = blk: {
         const smp = std.heap.smp_allocator;
-        prng = std.Random.DefaultPrng.init(12345); // Reset PRNG
+        var local_prng = std.Random.DefaultPrng.init(12345);
+        const random = local_prng.random();
         var timer = std.time.Timer.start() catch break :blk @as(u64, 0);
         for (0..iterations) |_| {
             var ptrs: [num_ptrs]?[]u8 = undefined;
@@ -56,7 +54,9 @@ pub fn main() !void {
 
     const zmem_time = blk: {
         const smp = zmemalloc.allocator();
-        prng = std.Random.DefaultPrng.init(12345); // Reset PRNG
+        var local_prng = std.Random.DefaultPrng.init(12345);
+        const random = local_prng.random();
+
         var timer = std.time.Timer.start() catch break :blk @as(u64, 0);
         for (0..iterations) |_| {
             var ptrs: [num_ptrs]?[]u8 = undefined;
@@ -95,7 +95,9 @@ pub fn main() !void {
     // // smp_allocator
     const mimalloc_time = blk: {
         const smp = mimalloc.mimalloc_allocator;
-        prng = std.Random.DefaultPrng.init(12345); // Reset PRNG
+        var local_prng = std.Random.DefaultPrng.init(12345);
+        const random = local_prng.random();
+
         var timer = std.time.Timer.start() catch break :blk @as(u64, 0);
         for (0..iterations) |_| {
             var ptrs: [num_ptrs]?[]u8 = undefined;
@@ -133,7 +135,9 @@ pub fn main() !void {
     //
     const c_time = blk: {
         const c = std.heap.c_allocator;
-        prng = std.Random.DefaultPrng.init(12345); // Reset PRNG
+        var local_prng = std.Random.DefaultPrng.init(12345);
+        const random = local_prng.random();
+
         var timer = std.time.Timer.start() catch break :blk @as(u64, 0);
 
         for (0..iterations) |_| {

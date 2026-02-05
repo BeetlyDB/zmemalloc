@@ -1,14 +1,74 @@
 const std = @import("std");
+const utils = @import("src/util.zig");
+const types = @import("src/types.zig");
+
+const DEFAULT_PHYSICAL_MEMORY_IN_KIB = if (types.INTPTR_SIZE < 8) 4 * types.MiB else 8 * types.MiB;
+
+fn generateConfig(
+    b: *std.Build,
+    opt: std.builtin.OptimizeMode,
+    target: std.Build.ResolvedTarget,
+) *std.Build.Module {
+    _ = opt;
+    _ = target;
+
+    const thp: bool = utils.unix_detect_thp();
+
+    const config_content = std.fmt.allocPrint(
+        b.allocator,
+        \\const std = @import("std");
+        \\
+        \\pub const Config = struct {{
+        \\    pub const page_size: comptime_int = {};
+        \\    pub const physical_memory_kib: comptime_int = {};
+        \\    pub const has_overcommit: bool = {};
+        \\    pub const thp: bool = {};
+        \\}};
+    ,
+        .{
+            std.heap.pageSize(),
+            utils.phisical_memory() orelse DEFAULT_PHYSICAL_MEMORY_IN_KIB,
+            utils.unix_detect_overcommit(),
+            thp,
+        },
+    ) catch |err| {
+        std.log.err("Failed to generate config.zig: {}", .{err});
+        @panic("cannot create config file,try to restart");
+    };
+
+    const config_module = b.createModule(.{
+        .root_source_file = b.addWriteFiles().add("config.zig", config_content),
+    });
+    return config_module;
+}
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
 
     const optimize = b.standardOptimizeOption(.{});
+    const conf = generateConfig(b, optimize, target);
     const mod = b.addModule("zmemalloc", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
+        .optimize = optimize,
     });
+    strip(mod);
+    mod.addImport("config", conf);
 
+    const lib_mod = b.createModule(.{
+        .root_source_file = b.path("libso/libzmemalloc.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "zmemalloc", .module = mod },
+        },
+    });
+    const zmemalloc_lib_static = build_library(b, "zmemalloc_static", lib_mod, .static);
+    strip_step(zmemalloc_lib_static);
+    b.installArtifact(zmemalloc_lib_static);
+    const zmemalloc_lib_dynamic = build_library(b, "zmemalloc_dynamic", lib_mod, .dynamic);
+    strip_step(zmemalloc_lib_dynamic);
+    b.installArtifact(zmemalloc_lib_dynamic);
     const mimalloc_dep = b.dependency("mimalloc", .{});
     const mimalloc_module = b.addTranslateC(.{
         .root_source_file = mimalloc_dep.path("include/mimalloc.h"),
@@ -17,7 +77,7 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     }).createModule();
 
-    const mimalloc_lib = build_library(b, "mimalloc", mimalloc_module);
+    const mimalloc_lib = build_library(b, "mimalloc", mimalloc_module, .static);
 
     mimalloc_lib.addCSourceFiles(.{
         .root = mimalloc_dep.path("src"),
@@ -61,17 +121,19 @@ pub fn build(b: *std.Build) void {
     });
 
     const exe = b.addExecutable(.{
-        .name = "zmemalloc",
+        .name = "bench",
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/main.zig"),
             .target = target,
             .optimize = optimize,
             .imports = &.{
-                .{ .name = "zmemalloc", .module = mod },
                 .{ .name = "mimalloc_zig", .module = mimalloc_zig },
+                .{ .name = "config", .module = conf },
+                .{ .name = "zmemalloc", .module = mod },
             },
         }),
     });
+    strip_step(exe);
 
     b.installArtifact(exe);
 
@@ -120,13 +182,18 @@ pub fn build(b: *std.Build) void {
     // and reading its source code will allow you to master it.
 }
 
-fn build_library(b: *std.Build, name: []const u8, module: *std.Build.Module) *std.Build.Step.Compile {
+fn build_library(
+    b: *std.Build,
+    name: []const u8,
+    module: *std.Build.Module,
+    linkage: std.builtin.LinkMode,
+) *std.Build.Step.Compile {
     const l = b.addLibrary(.{
         .name = name,
         .root_module = module,
-        .linkage = .static,
+        .linkage = linkage,
     });
-    // strip_step(l);
+    strip_step(l);
 
     return l;
 }
@@ -157,13 +224,13 @@ fn build_module(
     options: std.Build.Module.CreateOptions,
 ) *std.Build.Module {
     const m = b.createModule(options);
-    // strip(m);
+    strip(m);
     return m;
 }
 
 fn strip(root_module: *std.Build.Module) void {
     if (root_module.optimize != .Debug and root_module.optimize != .ReleaseSafe) {
-        root_module.strip = true;
+        // root_module.strip = true;
         root_module.omit_frame_pointer = true;
         root_module.unwind_tables = .none;
         root_module.sanitize_c = .off;

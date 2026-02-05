@@ -58,6 +58,7 @@ pub const Segment = struct {
     page_shift: usize = 0,
     page_kind: PageKind = .small,
     header_slices: usize = 0, // Pre-computed for fast pageFromPtr
+    first_free_page: u16 = 0, // Hint for next free page (avoids O(n) scan)
     pages: [types.SLICES_PER_SEGMENT]Page = undefined,
 
     pub const PageKind = enum(u8) {
@@ -185,9 +186,9 @@ pub const Segment = struct {
     }
 
     pub inline fn pageClear(self: *Self, pg: *Page) void {
+        const page_idx = pg.segment_idx;
         pg.segment_in_use = false;
         pg.flags.page_flags = .{};
-        pg.local_free = .init();
         pg.xthread_free.store(null, .release);
         pg.free = queue.IntrusiveLifo(page_mod.Block).init();
         pg.block_size = 0;
@@ -197,6 +198,12 @@ pub const Segment = struct {
         pg.used = 0;
         pg.next = null;
         pg.prev = null;
+
+        // Update hint if this page comes before current hint
+        if (page_idx < self.first_free_page) {
+            self.first_free_page = @intCast(page_idx);
+        }
+
         if (self.allow_purge) {
             self.pagePurge(pg);
         }
@@ -211,10 +218,25 @@ pub const Segment = struct {
     }
 
     pub fn findFreePage(self: *Self) ?*Page {
-        for (0..self.capacity) |i| {
+        const cap = self.capacity;
+        if (cap == 0) return null;
+
+        // Start search from hint (first_free_page)
+        var i: usize = self.first_free_page;
+        var checked: usize = 0;
+
+        while (checked < cap) : ({
+            i = if (i + 1 >= cap) 0 else i + 1;
+            checked += 1;
+        }) {
             const pg = &self.pages[i];
+            @prefetch(pg, .{ .cache = .data, .locality = 3, .rw = .read });
             if (!pg.segment_in_use) {
+                const next_i = if (i + 1 >= self.capacity) 0 else i + 1;
+                @prefetch(&self.pages[next_i], .{ .cache = .data, .locality = 3 });
                 if (self.pageClaim(pg)) {
+                    // Update hint to next position
+                    self.first_free_page = @intCast(if (i + 1 >= cap) 0 else i + 1);
                     return pg;
                 }
             }
@@ -419,7 +441,7 @@ pub const SegmentsTLD = struct {
     peak_size: usize = 0,
     reclaim_count: usize = 0,
     subproc: ?*subproc_m.Subproc = null,
-    stats: ?*Stats = null,
+    // stats: ?*Stats = null,
 
     os_alloc: std.mem.Allocator = undefined,
 
@@ -660,6 +682,13 @@ pub const SegmentsTLD = struct {
 
         var segment = q.tail;
         while (segment) |seg| {
+            const next_seg = seg.prev;
+            if (next_seg) |ns| {
+                @prefetch(ns, .{ .cache = .data, .locality = 3, .rw = .read });
+                // Prefetch pages array area
+                @prefetch(@as([*]u8, @ptrCast(ns)) + @offsetOf(Segment, "pages"), .{ .cache = .data, .locality = 3 });
+            }
+            @prefetch(seg, .{ .cache = .data, .locality = 3, .rw = .read });
             if (seg.hasFree()) {
                 if (seg.findFreePage()) |pg| {
                     if (!seg.hasFree()) {
@@ -690,7 +719,6 @@ pub const SegmentsTLD = struct {
             pg.reserved = 0;
             pg.used = 0;
             pg.free = .init();
-            pg.local_free = .init();
             pg.xthread_free.store(null, .release);
             pg.next = null;
             pg.prev = null;
@@ -739,7 +767,6 @@ pub const SegmentsTLD = struct {
             pg.reserved = 0;
             pg.used = 0;
             pg.free = .init();
-            pg.local_free = .init();
             pg.xthread_free.store(null, .release);
             pg.next = null;
             pg.prev = null;
@@ -777,7 +804,7 @@ pub const SegmentsTLD = struct {
     }
 
     /// Main entry point for page allocation
-    pub fn allocPage(self: *Self, block_size: usize) ?*Page {
+    pub inline fn allocPage(self: *Self, block_size: usize) ?*Page {
         if (block_size <= types.SMALL_OBJ_SIZE_MAX) {
             return self.allocSmallPage(block_size);
         } else if (block_size <= types.MEDIUM_OBJ_SIZE_MAX) {
@@ -965,21 +992,21 @@ pub const SegmentsTLD = struct {
         pg.flags.is_zero_init = true;
     }
 
-    pub fn getStats(self: *const Self) struct {
-        count: usize,
-        peak_count: usize,
-        current_size: usize,
-        peak_size: usize,
-        reclaim_count: usize,
-    } {
-        return .{
-            .count = self.count,
-            .peak_count = self.peak_count,
-            .current_size = self.current_size,
-            .peak_size = self.peak_size,
-            .reclaim_count = self.reclaim_count,
-        };
-    }
+    // pub fn getStats(self: *const Self) struct {
+    //     count: usize,
+    //     peak_count: usize,
+    //     current_size: usize,
+    //     peak_size: usize,
+    //     reclaim_count: usize,
+    // } {
+    //     return .{
+    //         .count = self.count,
+    //         .peak_count = self.peak_count,
+    //         .current_size = self.current_size,
+    //         .peak_size = self.peak_size,
+    //         .reclaim_count = self.reclaim_count,
+    //     };
+    // }
 };
 
 // =============================================================================
@@ -1487,20 +1514,20 @@ test "Segment: isValid" {
     try testing.expect(!segment.isValid());
 }
 
-test "SegmentsTLD: getStats" {
-    const testing = std.testing;
-
-    var tld = SegmentsTLD{};
-
-    tld.trackSize(1000);
-    tld.trackSize(2000);
-
-    const stats = tld.getStats();
-    try testing.expectEqual(@as(usize, 2), stats.count);
-    try testing.expectEqual(@as(usize, 3000), stats.current_size);
-    try testing.expectEqual(@as(usize, 2), stats.peak_count);
-    try testing.expectEqual(@as(usize, 3000), stats.peak_size);
-}
+// test "SegmentsTLD: getStats" {
+//     const testing = std.testing;
+//
+//     var tld = SegmentsTLD{};
+//
+//     tld.trackSize(1000);
+//     tld.trackSize(2000);
+//
+//     const stats = tld.getStats();
+//     try testing.expectEqual(@as(usize, 2), stats.count);
+//     try testing.expectEqual(@as(usize, 3000), stats.current_size);
+//     try testing.expectEqual(@as(usize, 2), stats.peak_count);
+//     try testing.expectEqual(@as(usize, 3000), stats.peak_size);
+// }
 
 test "SegmentsTLD: isWithinTarget" {
     const testing = std.testing;

@@ -2,6 +2,50 @@ const std = @import("std");
 const builtin = @import("builtin");
 const testing = std.testing;
 const types = @import("types.zig");
+const posix = std.posix;
+const linux = std.os.linux;
+
+pub fn unix_detect_overcommit() bool {
+    var os_overcommited: bool = true;
+
+    const fd = posix.open("/proc/sys/vm/overcommit_memory", .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0) catch return os_overcommited;
+    defer posix.close(fd);
+    var buf: [32]u8 = undefined;
+    const nread = posix.read(fd, &buf) catch return os_overcommited;
+    if (nread >= 1) {
+        // <https://www.kernel.org/doc/Documentation/vm/overcommit-accounting>
+        os_overcommited = buf[0] == '0' or buf[0] == '1';
+    }
+
+    return os_overcommited;
+}
+
+pub inline fn phisical_memory() ?usize {
+    var info: linux.Sysinfo = undefined;
+    if (linux.sysinfo(&info) != 0) return null;
+
+    return (@as(usize, info.totalram) * info.mem_unit) / 1024;
+}
+
+pub inline fn unix_detect_thp() bool {
+    const sys_state_always = "[always] madvise never\n";
+
+    const fd = posix.open("/sys/kernel/mm/transparent_hugepage/enabled", .{ .ACCMODE = .RDONLY }, 0) catch return false;
+    defer posix.close(fd);
+    var buf: [32]u8 = undefined;
+
+    const nread = posix.read(fd, &buf) catch return false;
+
+    if (nread > 1) {
+        if (std.mem.eql(u8, sys_state_always, buf[0..])) {
+            return true;
+        } else {
+            return false;
+        }
+    } else {
+        return false;
+    }
+}
 
 pub const assert = switch (builtin.mode) {
     .Debug, .ReleaseSafe => std.debug.assert,

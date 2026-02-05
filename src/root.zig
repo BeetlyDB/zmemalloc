@@ -18,7 +18,6 @@ const Segment = segment_mod.Segment;
 const TLD = tld_mod.TLD;
 const SegmentAbandonedQueue = segment_mod.SegmentAbandonedQueue;
 
-const RETIRE_CYCLES: u8 = 16;
 const MAX_SCAN_PAGES = 8;
 const COLLECT_INTERVAL: usize = 512;
 const ABANDON_RECLAIM_LIMIT: usize = 8; // Max segments to reclaim per allocation
@@ -40,11 +39,11 @@ var active_thread_count: Atomic(usize) = .init(0);
 threadlocal var tld: TLD = .{};
 threadlocal var tld_initialized: bool = false;
 threadlocal var alloc_counter: usize = 0;
-// Direct heap pointer for faster access in hot path
+// Direct heap pointer — also serves as init sentinel (null = not initialized)
 threadlocal var cached_heap: ?*Heap = null;
 
 inline fn ensureTldInitialized() *TLD {
-    if (!tld_initialized) {
+    if (cached_heap == null) {
         @branchHint(.cold);
         initTld(&tld);
         tld_initialized = true;
@@ -54,9 +53,17 @@ inline fn ensureTldInitialized() *TLD {
     return &tld;
 }
 
-/// Get heap for fast path - single threadlocal access
-inline fn getHeapFast() ?*Heap {
-    return cached_heap;
+/// Get heap for fast path or initialize TLD — single threadlocal read
+inline fn getHeapOrInit() *Heap {
+    if (cached_heap) |h| {
+        @branchHint(.likely);
+        return h;
+    }
+    initTld(&tld);
+    tld_initialized = true;
+    cached_heap = tld.heap_backing;
+    _ = active_thread_count.fetchAdd(1, .monotonic);
+    return cached_heap.?;
 }
 
 inline fn initTld(t: *TLD) void {
@@ -72,42 +79,52 @@ inline fn initTld(t: *TLD) void {
 }
 
 /// Fast path for small allocations (inlined, minimal ops)
+/// Only does direct page lookup + free list pop — no bin queue scanning.
 inline fn mallocSmallFast(heap: *Heap, size: usize) ?[*]u8 {
     const wsize = (size + types.INTPTR_SIZE - 1) / types.INTPTR_SIZE;
-    const page = heap.pages_free_direct[wsize] orelse return null;
+    const page = heap.pages_free_direct[wsize] orelse {
+        @branchHint(.unlikely);
+        return null;
+    };
 
     if (page.popFreeBlock()) |block| {
+        @branchHint(.likely);
         return @ptrCast(block);
     }
 
-    // Page has no free blocks - try bin queue's tail directly
-    const bin = page_mod.binFromSize(size);
-    if (bin < heap.pages.len) {
-        if (heap.pages[bin].tail) |pg| {
-            heap.pages_free_direct[wsize] = pg;
-            // Try to allocate from the new page
-            if (pg.popFreeBlock()) |block| {
-                return @ptrCast(block);
-            }
-        }
-    }
+    // Direct page exhausted — clear it so we don't retry next time.
+    // mallocMedium will find a page via the bin queue.
     heap.pages_free_direct[wsize] = null;
     return null;
 }
 
-/// Medium allocation path
+/// Medium allocation path — bin queue lookup
 inline fn mallocMedium(heap: *Heap, size: usize) ?[*]u8 {
     const bin = page_mod.binFromSize(size);
     const pq = &heap.pages[bin];
 
     if (pq.tail) |pg| {
+        @branchHint(.likely);
         if (pg.popFreeBlock()) |block| {
-            if (!pg.hasFree()) {
+            @branchHint(.likely);
+            // Update direct pointer so next small alloc skips bin lookup
+            setDirectPointerForBlockSize(heap, pg);
+
+            // Quick check: is page exhausted? (skip atomic xthread load)
+            if (!pg.hasFreeQuick()) {
+                @branchHint(.unlikely);
                 pg.pageRemoveFromBin(heap, bin);
                 pg.set_in_full(true);
                 clearDirectPointersForPage(heap, pg);
             }
             return @ptrCast(block);
+        } else {
+            @branchHint(.unlikely);
+            // Page fully exhausted (free list empty, bump done, xthread collected).
+            // Remove from bin so mallocGeneric doesn't retry the same page.
+            pg.pageRemoveFromBin(heap, bin);
+            pg.set_in_full(true);
+            clearDirectPointersForPage(heap, pg);
         }
     }
 
@@ -163,13 +180,16 @@ inline fn mallocGeneric(heap: *Heap, size: usize, zero: bool) ?[*]u8 {
         const pq = &heap.pages[bin];
         if (pq.tail) |pg| {
             if (pg.popFreeBlock()) |block| {
+                @branchHint(.likely);
                 if (!pg.hasFree()) {
+                    @branchHint(.unlikely);
                     pg.pageRemoveFromBin(heap, bin);
                     pg.set_in_full(true);
                     clearDirectPointersForPage(heap, pg);
                 }
                 const ptr: [*]u8 = @ptrCast(block);
                 if (zero) {
+                    @branchHint(.cold);
                     @memset(ptr[0..block_size], 0);
                 }
                 return ptr;
@@ -182,11 +202,18 @@ inline fn mallocGeneric(heap: *Heap, size: usize, zero: bool) ?[*]u8 {
     if (page == null) {
         // Try to reclaim abandoned segments from other threads
         if (global_subproc.abandoned_count.load(.monotonic) > 0) {
+            @branchHint(.cold);
             _ = reclaimAbandoned(ABANDON_RECLAIM_LIMIT);
             page = t.segments.allocPage(block_size);
         }
     }
-    const pg = page orelse return null;
+
+    const pg = page orelse {
+        @branchHint(.unlikely);
+        return null;
+    };
+
+    @prefetch(pg, .{ .cache = .data, .locality = 3, .rw = .read });
 
     // Initialize page if not yet initialized (page_start is null)
     if (pg.page_start == null) {
@@ -198,16 +225,11 @@ inline fn mallocGeneric(heap: *Heap, size: usize, zero: bool) ?[*]u8 {
         pg.init(block_size, page_start, page_size);
     }
 
-    // Extend free list if needed - use larger batch
-    if (pg.free.empty() and pg.reserved < pg.capacity) {
-        @branchHint(.cold);
-        const batch = if (pg.extend_batch > 0) @as(usize, pg.extend_batch) else 16;
-        const extend = @min(batch, pg.capacity - pg.reserved);
-        pg.extendFree(extend);
-    }
-
-    // Get block
-    const block = pg.popFreeBlock() orelse return null;
+    // Get block (popFreeBlock handles bump allocation internally)
+    const block = pg.popFreeBlock() orelse {
+        @branchHint(.unlikely);
+        return null;
+    };
     const ptr: [*]u8 = @ptrCast(block);
 
     if (types.DEBUG) {
@@ -218,13 +240,14 @@ inline fn mallocGeneric(heap: *Heap, size: usize, zero: bool) ?[*]u8 {
 
     // Zero if requested
     if (zero) {
-        @branchHint(.unlikely);
+        @branchHint(.cold);
         @memset(ptr[0..block_size], 0);
     }
 
     // Add page to heap queue if not already there
     // Use in_bin flag to track queue membership
     if (bin < heap.pages.len and !pg.flags.page_flags.in_bin) {
+        @branchHint(.likely);
         pg.set_in_full(false);
         pg.pagePushBin(heap, bin);
     }
@@ -247,7 +270,6 @@ inline fn clearDirectPointersForPage(heap: *Heap, page: *Page) void {
     }
 }
 
-//TODO: make in collect
 inline fn retirePage(page: *Page) void {
     const heap = &heap_mod.heap_main;
     const bin = page_mod.binFromSize(page.block_size);
@@ -295,14 +317,15 @@ inline fn freeImpl(ptr: ?*anyopaque) void {
     if (page_thread == fastThreadId()) {
         @branchHint(.likely);
         // Hot path: just push to free list
+        @prefetch(block, .{ .cache = .data, .locality = 3, .rw = .read });
         page.pushFreeBlock(block);
         // Cold path: handle full page transition
         if (page.is_in_full()) {
-            @branchHint(.cold);
+            @branchHint(.unlikely);
             freeColdPath(page);
         }
     } else if (page_thread == 0) {
-        @branchHint(.likely);
+        @prefetch(block, .{ .cache = .data, .locality = 3, .rw = .read });
         // Abandoned page - push to free list
         page.pushFreeBlock(block);
     } else {
@@ -408,9 +431,8 @@ pub fn malloc(size: usize) ?[*]u8 {
         return null;
     }
 
-    // Ensure TLD initialized (just bool check after first call)
-    _ = ensureTldInitialized();
-    const heap = cached_heap orelse return null;
+    // Single threadlocal read — also initializes TLD on first call
+    const heap = getHeapOrInit();
 
     // Fast path for small allocations
     if (size <= MAX_FAST_SIZE) {
@@ -494,7 +516,7 @@ pub fn allocator() std.mem.Allocator {
 // =============================================================================
 
 /// Get usable size of allocation
-pub fn usableSize(ptr: ?*const anyopaque) usize {
+pub inline fn usableSize(ptr: ?*const anyopaque) usize {
     if (ptr == null) return 0;
     const page = Segment.pageFromPtr(ptr.?);
     return page.block_size;
@@ -639,6 +661,7 @@ pub fn threadExit() void {
 
     // Mark TLD as uninitialized
     tld_initialized = false;
+    cached_heap = null;
     _ = active_thread_count.fetchSub(1, .monotonic);
 
     // Clear heap reference
@@ -696,27 +719,27 @@ pub fn getAbandonedCount() usize {
 }
 
 /// Get memory statistics
-pub fn getStats() struct {
-    segments_count: usize,
-    segments_size: usize,
-    peak_segments: usize,
-    peak_size: usize,
-} {
-    if (!tld_initialized) return .{
-        .segments_count = 0,
-        .segments_size = 0,
-        .peak_segments = 0,
-        .peak_size = 0,
-    };
-
-    const stats = tld.segments.getStats();
-    return .{
-        .segments_count = stats.count,
-        .segments_size = stats.current_size,
-        .peak_segments = stats.peak_count,
-        .peak_size = stats.peak_size,
-    };
-}
+// pub fn getStats() struct {
+//     segments_count: usize,
+//     segments_size: usize,
+//     peak_segments: usize,
+//     peak_size: usize,
+// } {
+//     if (!tld_initialized) return .{
+//         .segments_count = 0,
+//         .segments_size = 0,
+//         .peak_segments = 0,
+//         .peak_size = 0,
+//     };
+//
+//     const stats = tld.segments.getStats();
+//     return .{
+//         .segments_count = stats.count,
+//         .segments_size = stats.current_size,
+//         .peak_segments = stats.peak_count,
+//         .peak_size = stats.peak_size,
+//     };
+// }
 
 /// Aligned allocation (internal)
 fn alignedAlloc(alignment: usize, size: usize) ?*anyopaque {
@@ -747,42 +770,39 @@ pub fn deinitThread() void {
     if (tld_initialized) {
         // TODO: Abandon or free all thread-local allocations
         tld_initialized = false;
+        cached_heap = null;
     }
 }
 
-// =============================================================================
-// C ABI Exports (for use as libc malloc replacement)
-// =============================================================================
-
 /// C malloc - allocate memory
-export fn c_malloc(size: usize) ?*anyopaque {
+pub inline fn c_malloc(size: usize) ?*anyopaque {
     return @ptrCast(malloc(size));
 }
 
 /// C free - free memory
-export fn c_free(ptr: ?*anyopaque) void {
+pub inline fn c_free(ptr: ?*anyopaque) void {
     freeImpl(ptr);
 }
 
 /// C realloc - reallocate memory
-export fn c_realloc(ptr: ?*anyopaque, size: usize) ?*anyopaque {
+pub inline fn c_realloc(ptr: ?*anyopaque, size: usize) ?*anyopaque {
     return @ptrCast(realloc(ptr, size));
 }
 
 /// C calloc - allocate zeroed array
-export fn c_calloc(count: usize, size: usize) ?*anyopaque {
+pub inline fn c_calloc(count: usize, size: usize) ?*anyopaque {
     return @ptrCast(calloc(count, size));
 }
 
 /// C aligned_alloc - allocate aligned memory (C11)
-export fn c_aligned_alloc(alignment: usize, size: usize) ?*anyopaque {
+pub inline fn c_aligned_alloc(alignment: usize, size: usize) ?*anyopaque {
     // C11: size must be multiple of alignment
     if (size % alignment != 0) return null;
     return alignedAlloc(alignment, size);
 }
 
 /// POSIX posix_memalign - allocate aligned memory
-export fn c_posix_memalign(memptr: *?*anyopaque, alignment: usize, size: usize) c_int {
+pub inline fn c_posix_memalign(memptr: *?*anyopaque, alignment: usize, size: usize) c_int {
     // Alignment must be power of 2 and multiple of sizeof(void*)
     if (alignment < @sizeOf(*anyopaque)) return 22; // EINVAL
     if (alignment & (alignment - 1) != 0) return 22; // EINVAL
@@ -795,42 +815,42 @@ export fn c_posix_memalign(memptr: *?*anyopaque, alignment: usize, size: usize) 
 }
 
 /// Legacy memalign - allocate aligned memory
-export fn c_memalign(alignment: usize, size: usize) ?*anyopaque {
+pub inline fn c_memalign(alignment: usize, size: usize) ?*anyopaque {
     return alignedAlloc(alignment, size);
 }
 
 /// valloc - allocate page-aligned memory
-export fn c_valloc(size: usize) ?*anyopaque {
+pub inline fn c_valloc(size: usize) ?*anyopaque {
     return alignedAlloc(std.heap.page_size_min, size);
 }
 
 /// pvalloc - allocate page-aligned memory, rounded up to page size
-export fn c_pvalloc(size: usize) ?*anyopaque {
+pub inline fn c_pvalloc(size: usize) ?*anyopaque {
     const page_size = std.heap.page_size_min;
     const aligned_size = (size + page_size - 1) & ~(page_size - 1);
     return alignedAlloc(page_size, aligned_size);
 }
 
 /// malloc_usable_size - get usable size of allocation
-export fn c_malloc_usable_size(ptr: ?*anyopaque) usize {
+pub inline fn c_malloc_usable_size(ptr: ?*anyopaque) usize {
     return usableSize(ptr);
 }
 
-/// Deinitialize thread (call before thread exit for cleanup)
-export fn zmem_thread_deinit() void {
-    deinitThread();
-}
+// /// Deinitialize thread (call before thread exit for cleanup)
+// export fn zmem_thread_deinit() void {
+//     deinitThread();
+// }
 
 /// Collect unused memory and return to OS
 /// force=true to aggressively return all unused memory
-export fn zmem_collect(force: bool) usize {
+pub inline fn zmemalloc_collect(force: bool) usize {
     return collect(force);
 }
 
-/// Get current memory usage in bytes
-export fn zmem_get_memory_usage() usize {
-    return getStats().segments_size;
-}
+// /// Get current memory usage in bytes
+// export fn zmem_get_memory_usage() usize {
+//     return getStats().segments_size;
+// }
 
 // =============================================================================
 // Tests
@@ -945,10 +965,6 @@ test "std.mem.Allocator interface" {
     try std.testing.expectEqual(@as(u8, 0xCC), slice[0]);
     try std.testing.expectEqual(@as(u8, 0xCC), slice[127]);
 }
-
-// =============================================================================
-// Data Correctness Tests
-// =============================================================================
 
 test "data integrity: write patterns preserved" {
     const sizes = [_]usize{ 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192 };
@@ -1858,4 +1874,810 @@ test "benchmark: mixed workload" {
     std.debug.print("{s:<15}: {d:>10.2} ms\n", .{ "zmemalloc", zmem_ms });
     std.debug.print("{s:<15}: {d:>10.2} ms\n", .{ "smp_allocator", smp_ms });
     std.debug.print("{s:<15}: {d:>10.2}x\n\n", .{ "Speedup", speedup });
+}
+
+test "correctness: small size class boundaries" {
+    // Test every word-size boundary for small allocations (1..SMALL_WSIZE_MAX words)
+    for (1..types.SMALL_WSIZE_MAX + 1) |wsize| {
+        const size = wsize * types.INTPTR_SIZE;
+        const ptr = malloc(size) orelse {
+            try std.testing.expect(false);
+            continue;
+        };
+        // Write and verify
+        @memset(ptr[0..size], @as(u8, @truncate(wsize)));
+        for (ptr[0..size]) |byte| {
+            try std.testing.expectEqual(@as(u8, @truncate(wsize)), byte);
+        }
+        // Usable size must be >= requested
+        const usable = usableSize(ptr);
+        try std.testing.expect(usable >= size);
+        free_mem(ptr);
+    }
+}
+
+test "correctness: medium size class boundaries" {
+    const sizes = [_]usize{
+        types.SMALL_OBJ_SIZE_MAX - 1,
+        types.SMALL_OBJ_SIZE_MAX,
+        types.SMALL_OBJ_SIZE_MAX + 1,
+        types.SMALL_OBJ_SIZE_MAX + 8,
+        types.SMALL_OBJ_SIZE_MAX * 2,
+        types.MEDIUM_OBJ_SIZE_MAX / 4,
+        types.MEDIUM_OBJ_SIZE_MAX / 2,
+        types.MEDIUM_OBJ_SIZE_MAX - 1,
+        types.MEDIUM_OBJ_SIZE_MAX,
+    };
+    for (sizes) |size| {
+        const ptr = malloc(size) orelse {
+            try std.testing.expect(false);
+            continue;
+        };
+        @memset(ptr[0..size], 0xBB);
+        for (ptr[0..size]) |byte| {
+            try std.testing.expectEqual(@as(u8, 0xBB), byte);
+        }
+        try std.testing.expect(usableSize(ptr) >= size);
+        free_mem(ptr);
+    }
+}
+
+test "correctness: large and huge size classes" {
+    const sizes = [_]usize{
+        types.MEDIUM_OBJ_SIZE_MAX + 1,
+        types.MEDIUM_OBJ_SIZE_MAX * 2,
+        256 * types.KiB,
+        512 * types.KiB,
+        1 * types.MiB,
+        4 * types.MiB,
+        types.LARGE_OBJ_SIZE_MAX / 2,
+        types.LARGE_OBJ_SIZE_MAX,
+    };
+    for (sizes) |size| {
+        const ptr = malloc(size) orelse continue; // huge may fail on constrained systems
+        // Write pattern at beginning, middle, end
+        ptr[0] = 0xAA;
+        ptr[size / 2] = 0xBB;
+        ptr[size - 1] = 0xCC;
+        try std.testing.expectEqual(@as(u8, 0xAA), ptr[0]);
+        try std.testing.expectEqual(@as(u8, 0xBB), ptr[size / 2]);
+        try std.testing.expectEqual(@as(u8, 0xCC), ptr[size - 1]);
+        free_mem(ptr);
+    }
+}
+
+test "correctness: natural alignment of allocations" {
+    // All allocations must be at least INTPTR_SIZE aligned
+    const sizes = [_]usize{ 1, 2, 3, 4, 5, 7, 8, 9, 15, 16, 17, 31, 32, 33, 63, 64, 65, 127, 128, 255, 256, 512, 1024, 4096, 8192 };
+    for (sizes) |size| {
+        const ptr = malloc(size) orelse continue;
+        const addr = @intFromPtr(ptr);
+        try std.testing.expect(addr % types.INTPTR_SIZE == 0);
+        free_mem(ptr);
+    }
+}
+
+test "correctness: allocator interface alignment" {
+    const alloc = allocator();
+    const alignments = [_]std.mem.Alignment{ .@"1", .@"2", .@"4", .@"8", .@"16" };
+    inline for (alignments) |alignment| {
+        const slice = alloc.alignedAlloc(u8, alignment, 100) catch unreachable;
+        const addr = @intFromPtr(slice.ptr);
+        try std.testing.expect(addr % alignment.toByteUnits() == 0);
+        alloc.free(slice);
+    }
+}
+
+test "correctness: no duplicate pointers from concurrent allocations" {
+    const N = 1000;
+    var ptrs: [N]usize = undefined;
+
+    for (0..N) |i| {
+        const ptr = malloc(64) orelse {
+            ptrs[i] = 0;
+            continue;
+        };
+        ptrs[i] = @intFromPtr(ptr);
+    }
+
+    // Every non-zero address must be unique
+    for (0..N) |i| {
+        if (ptrs[i] == 0) continue;
+        for (i + 1..N) |j| {
+            if (ptrs[j] == 0) continue;
+            try std.testing.expect(ptrs[i] != ptrs[j]);
+        }
+    }
+
+    // Free all
+    for (ptrs) |addr| {
+        if (addr != 0) free_mem(@ptrFromInt(addr));
+    }
+}
+
+test "correctness: allocations don't overlap — byte-level check" {
+    const N = 200;
+    var ptrs: [N]?[*]u8 = [_]?[*]u8{null} ** N;
+    var sizes: [N]usize = [_]usize{0} ** N;
+
+    // Allocate with varied sizes and write unique patterns
+    for (0..N) |i| {
+        const size = 16 + (i % 64) * 16; // 16..1040
+        ptrs[i] = malloc(size);
+        sizes[i] = size;
+        if (ptrs[i]) |p| {
+            @memset(p[0..size], @as(u8, @truncate(i)));
+        }
+    }
+
+    // Verify none were corrupted
+    for (0..N) |i| {
+        if (ptrs[i]) |p| {
+            const expected: u8 = @truncate(i);
+            for (p[0..sizes[i]]) |byte| {
+                try std.testing.expectEqual(expected, byte);
+            }
+        }
+    }
+
+    for (&ptrs) |*p| {
+        if (p.*) |ptr| free_mem(ptr);
+        p.* = null;
+    }
+}
+
+test "correctness: same-size allocations fill page correctly" {
+    // Allocate many blocks of the same size to exercise page filling
+    const size = 64;
+    const N = 2000; // Should span multiple pages (64 KiB page / 64 bytes = 1024 per page)
+    var ptrs: [N]?[*]u8 = [_]?[*]u8{null} ** N;
+
+    for (0..N) |i| {
+        ptrs[i] = malloc(size);
+        try std.testing.expect(ptrs[i] != null);
+        if (ptrs[i]) |p| {
+            @memset(p[0..size], @as(u8, @truncate(i)));
+        }
+    }
+
+    // Verify all patterns
+    for (0..N) |i| {
+        if (ptrs[i]) |p| {
+            const expected: u8 = @truncate(i);
+            for (p[0..size]) |byte| {
+                try std.testing.expectEqual(expected, byte);
+            }
+        }
+    }
+
+    for (&ptrs) |*p| {
+        if (p.*) |ptr| free_mem(ptr);
+        p.* = null;
+    }
+}
+
+test "correctness: freed memory is reusable" {
+    // Allocate, free, allocate again — second allocation should succeed
+    const size = 128;
+    const N = 500;
+    for (0..N) |_| {
+        const ptr = malloc(size) orelse continue;
+        @memset(ptr[0..size], 0xFF);
+        free_mem(ptr);
+    }
+    // If memory leaked, this would eventually fail
+    for (0..N) |_| {
+        const ptr = malloc(size) orelse {
+            try std.testing.expect(false);
+            continue;
+        };
+        @memset(ptr[0..size], 0xAA);
+        free_mem(ptr);
+    }
+}
+
+test "correctness: free then realloc pattern" {
+    var ptrs: [50]?[*]u8 = [_]?[*]u8{null} ** 50;
+
+    // Phase 1: allocate all at size 32
+    for (&ptrs) |*p| {
+        p.* = malloc(32);
+        try std.testing.expect(p.* != null);
+        if (p.*) |ptr| @memset(ptr[0..32], 0x11);
+    }
+
+    // Phase 2: free every other, realloc the rest to 128
+    for (0..50) |i| {
+        if (i % 2 == 0) {
+            free_mem(ptrs[i]);
+            ptrs[i] = null;
+        } else {
+            if (ptrs[i]) |p| {
+                // Verify data before realloc
+                try std.testing.expectEqual(@as(u8, 0x11), p[0]);
+                ptrs[i] = realloc(p, 128);
+                try std.testing.expect(ptrs[i] != null);
+                if (ptrs[i]) |newp| {
+                    // Original 32 bytes preserved
+                    try std.testing.expectEqual(@as(u8, 0x11), newp[0]);
+                    @memset(newp[0..128], 0x22);
+                }
+            }
+        }
+    }
+
+    // Phase 3: fill freed slots
+    for (0..50) |i| {
+        if (ptrs[i] == null) {
+            ptrs[i] = malloc(64);
+            if (ptrs[i]) |p| @memset(p[0..64], 0x33);
+        }
+    }
+
+    // Free all
+    for (&ptrs) |*p| {
+        if (p.*) |ptr| free_mem(ptr);
+        p.* = null;
+    }
+}
+
+test "correctness: size zero returns null" {
+    try std.testing.expect(malloc(0) == null);
+}
+
+test "correctness: size one allocation" {
+    const ptr = malloc(1) orelse return error.OutOfMemory;
+    ptr[0] = 42;
+    try std.testing.expectEqual(@as(u8, 42), ptr[0]);
+    try std.testing.expect(usableSize(ptr) >= 1);
+    free_mem(ptr);
+}
+
+test "correctness: free null is safe" {
+    free_mem(null);
+    free_mem(null);
+    free_mem(null);
+}
+
+test "correctness: realloc null is malloc" {
+    const ptr = realloc(null, 100) orelse return error.OutOfMemory;
+    @memset(ptr[0..100], 0xDE);
+    try std.testing.expectEqual(@as(u8, 0xDE), ptr[0]);
+    free_mem(ptr);
+}
+
+test "correctness: realloc to zero is free" {
+    const ptr = malloc(100) orelse return error.OutOfMemory;
+    @memset(ptr[0..100], 0xAB);
+    const result = realloc(ptr, 0);
+    try std.testing.expect(result == null);
+}
+
+test "correctness: realloc same size preserves data" {
+    const ptr = malloc(64) orelse return error.OutOfMemory;
+    for (0..64) |i| ptr[i] = @truncate(i);
+
+    const new_ptr = realloc(ptr, 64) orelse return error.OutOfMemory;
+    for (0..64) |i| {
+        try std.testing.expectEqual(@as(u8, @truncate(i)), new_ptr[i]);
+    }
+    free_mem(new_ptr);
+}
+
+test "correctness: realloc shrink preserves prefix" {
+    const ptr = malloc(256) orelse return error.OutOfMemory;
+    for (0..256) |i| ptr[i] = @truncate(i *% 7);
+
+    const small = realloc(ptr, 32) orelse return error.OutOfMemory;
+    for (0..32) |i| {
+        try std.testing.expectEqual(@as(u8, @truncate(i *% 7)), small[i]);
+    }
+    free_mem(small);
+}
+
+test "correctness: realloc grow chain preserves data" {
+    var size: usize = 8;
+    var ptr = malloc(size) orelse return error.OutOfMemory;
+    @memset(ptr[0..size], 0xAA);
+
+    while (size < 16384) {
+        const new_size = size * 2;
+        const new_ptr = realloc(ptr, new_size) orelse return error.OutOfMemory;
+        // Old data preserved
+        for (new_ptr[0..size]) |byte| {
+            try std.testing.expectEqual(@as(u8, 0xAA), byte);
+        }
+        // Fill new portion
+        @memset(new_ptr[size..new_size], 0xAA);
+        ptr = new_ptr;
+        size = new_size;
+    }
+    free_mem(ptr);
+}
+
+test "correctness: zalloc all size classes zeroed" {
+    const sizes = [_]usize{ 1, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536 };
+    for (sizes) |size| {
+        const ptr = zalloc(size) orelse continue;
+        for (ptr[0..size]) |byte| {
+            try std.testing.expectEqual(@as(u8, 0), byte);
+        }
+        free_mem(ptr);
+    }
+}
+
+test "correctness: calloc zeroed after write-free cycle" {
+    // First pass: allocate, write pattern, free
+    for (0..50) |_| {
+        const ptr = malloc(256) orelse continue;
+        @memset(ptr[0..256], 0xFF);
+        free_mem(ptr);
+    }
+
+    // Second pass: calloc should still return zeroed memory
+    for (0..50) |_| {
+        const ptr = calloc(1, 256) orelse continue;
+        for (ptr[0..256]) |byte| {
+            try std.testing.expectEqual(@as(u8, 0), byte);
+        }
+        free_mem(ptr);
+    }
+}
+
+test "leak: rapid alloc-free same size 100k cycles" {
+    for (0..100_000) |_| {
+        const ptr = malloc(64) orelse continue;
+        ptr[0] = 1;
+        free_mem(ptr);
+    }
+    // If leaking, allocator would eventually fail or consume unbounded memory.
+    // Verify it still works:
+    const ptr = malloc(64) orelse return error.OutOfMemory;
+    free_mem(ptr);
+}
+
+test "leak: alloc many then free all — FIFO order" {
+    const N = 5000;
+    var ptrs: [N]?[*]u8 = undefined;
+
+    for (0..N) |i| {
+        ptrs[i] = malloc(32 + (i % 128) * 8);
+        try std.testing.expect(ptrs[i] != null);
+    }
+
+    // Free in FIFO order (first allocated = first freed)
+    for (0..N) |i| {
+        free_mem(ptrs[i]);
+    }
+}
+
+test "leak: alloc many then free all — LIFO order" {
+    const N = 5000;
+    var ptrs: [N]?[*]u8 = undefined;
+
+    for (0..N) |i| {
+        ptrs[i] = malloc(32 + (i % 128) * 8);
+        try std.testing.expect(ptrs[i] != null);
+    }
+
+    // Free in LIFO order (last allocated = first freed)
+    var i: usize = N;
+    while (i > 0) : (i -= 1) {
+        free_mem(ptrs[i - 1]);
+    }
+}
+
+test "leak: alloc-free sawtooth pattern" {
+    // Allocate in waves, free each wave before next
+    for (0..100) |wave| {
+        var ptrs: [100]?[*]u8 = [_]?[*]u8{null} ** 100;
+        for (0..100) |i| {
+            const size = 16 + ((wave * 100 + i) % 512) * 8;
+            ptrs[i] = malloc(size);
+            try std.testing.expect(ptrs[i] != null);
+        }
+        for (&ptrs) |*p| {
+            if (p.*) |ptr| free_mem(ptr);
+            p.* = null;
+        }
+    }
+}
+
+test "leak: alternating sizes stress" {
+    // Alternate between tiny and large allocations
+    for (0..10_000) |i| {
+        const size: usize = if (i % 2 == 0) 16 else 4096;
+        const ptr = malloc(size) orelse continue;
+        ptr[0] = 0xAB;
+        ptr[size - 1] = 0xCD;
+        free_mem(ptr);
+    }
+}
+
+test "leak: growing allocation chain" {
+    // Allocate progressively larger blocks
+    var size: usize = 8;
+    while (size <= 1 * types.MiB) : (size *= 2) {
+        const ptr = malloc(size) orelse break;
+        ptr[0] = 0x01;
+        ptr[size - 1] = 0x02;
+        free_mem(ptr);
+    }
+}
+
+test "leak: mixed size random pattern — 10k ops" {
+    var prng = std.Random.DefaultPrng.init(0xDEAD_BEEF);
+    const random = prng.random();
+    var ptrs: [512]?[*]u8 = [_]?[*]u8{null} ** 512;
+    var alloc_sizes: [512]usize = [_]usize{0} ** 512;
+
+    for (0..10_000) |_| {
+        const idx = random.uintLessThan(usize, 512);
+        if (ptrs[idx]) |ptr| {
+            free_mem(ptr);
+            ptrs[idx] = null;
+            alloc_sizes[idx] = 0;
+        } else {
+            const size = 1 + random.uintLessThan(usize, 8191);
+            ptrs[idx] = malloc(size);
+            alloc_sizes[idx] = size;
+            if (ptrs[idx]) |p| {
+                p[0] = @truncate(idx);
+                p[size - 1] = @truncate(idx);
+            }
+        }
+    }
+
+    // Verify and cleanup
+    for (0..512) |i| {
+        if (ptrs[i]) |p| {
+            const expected: u8 = @truncate(i);
+            try std.testing.expectEqual(expected, p[0]);
+            try std.testing.expectEqual(expected, p[alloc_sizes[i] - 1]);
+            free_mem(p);
+            ptrs[i] = null;
+        }
+    }
+}
+
+test "leak: realloc chains don't leak" {
+    for (0..500) |_| {
+        var ptr = malloc(16) orelse continue;
+        ptr = realloc(ptr, 64) orelse {
+            free_mem(ptr);
+            continue;
+        };
+        ptr = realloc(ptr, 256) orelse {
+            free_mem(ptr);
+            continue;
+        };
+        ptr = realloc(ptr, 32) orelse {
+            free_mem(ptr);
+            continue;
+        };
+        free_mem(ptr);
+    }
+}
+
+test "leak: capacity survives after heavy use" {
+    // Stress allocator then verify it still has full capacity
+    const ROUNDS = 20;
+    const ALLOCS_PER_ROUND = 2000;
+
+    for (0..ROUNDS) |_| {
+        var ptrs: [ALLOCS_PER_ROUND]?[*]u8 = [_]?[*]u8{null} ** ALLOCS_PER_ROUND;
+        for (0..ALLOCS_PER_ROUND) |i| {
+            ptrs[i] = malloc(64 + (i % 64) * 16);
+        }
+        for (&ptrs) |*p| {
+            if (p.*) |ptr| free_mem(ptr);
+            p.* = null;
+        }
+    }
+
+    // After all that, allocator should still work perfectly
+    var final_ptrs: [1000]?[*]u8 = undefined;
+    for (0..1000) |i| {
+        final_ptrs[i] = malloc(128);
+        try std.testing.expect(final_ptrs[i] != null);
+    }
+    for (final_ptrs) |p| {
+        if (p) |ptr| free_mem(ptr);
+    }
+}
+
+test "correctness: bin size round-trip" {
+    // For each bin, allocate at blockSizeForBin and verify usable size
+    for (1..types.BIN_HUGE + 1) |bin| {
+        const block_size = page_mod.blockSizeForBin(bin);
+        if (block_size == 0 or block_size > types.LARGE_OBJ_SIZE_MAX) continue;
+        const ptr = malloc(block_size) orelse continue;
+        const usable = usableSize(ptr);
+        try std.testing.expect(usable >= block_size);
+        free_mem(ptr);
+    }
+}
+
+test "correctness: isInHeapRegion for allocated pointers" {
+    const ptr = malloc(128) orelse return error.OutOfMemory;
+    try std.testing.expect(isInHeapRegion(ptr));
+    free_mem(ptr);
+
+    // Null should return false
+    try std.testing.expect(!isInHeapRegion(null));
+}
+
+test "correctness: page metadata consistent after alloc-free cycles" {
+    // Allocate enough to fill a page, free all, then allocate again
+    // This exercises page retirement and reuse
+    const block_size: usize = 64;
+    const blocks_per_page = types.SMALL_PAGE_SIZE / block_size;
+    const N = blocks_per_page + 100; // slightly more than one page
+
+    var ptrs: [2048]?[*]u8 = [_]?[*]u8{null} ** 2048;
+    const count = @min(N, ptrs.len);
+
+    // Fill
+    for (0..count) |i| {
+        ptrs[i] = malloc(block_size);
+        try std.testing.expect(ptrs[i] != null);
+        if (ptrs[i]) |p| @memset(p[0..block_size], 0xAA);
+    }
+
+    // Free all
+    for (0..count) |i| {
+        if (ptrs[i]) |p| {
+            // Verify data before free
+            try std.testing.expectEqual(@as(u8, 0xAA), p[0]);
+            free_mem(p);
+            ptrs[i] = null;
+        }
+    }
+
+    // Re-fill — should succeed (pages were recycled)
+    for (0..count) |i| {
+        ptrs[i] = malloc(block_size);
+        try std.testing.expect(ptrs[i] != null);
+        if (ptrs[i]) |p| @memset(p[0..block_size], 0xBB);
+    }
+
+    // Verify and free
+    for (0..count) |i| {
+        if (ptrs[i]) |p| {
+            try std.testing.expectEqual(@as(u8, 0xBB), p[0]);
+            free_mem(p);
+        }
+    }
+}
+
+test "correctness: Allocator.alloc and free varied types" {
+    const alloc = allocator();
+
+    // u8
+    const bytes = try alloc.alloc(u8, 200);
+    @memset(bytes, 0xCC);
+    alloc.free(bytes);
+
+    // u32
+    const ints = try alloc.alloc(u32, 100);
+    for (ints, 0..) |*v, i| v.* = @intCast(i);
+    for (ints, 0..) |v, i| try std.testing.expectEqual(@as(u32, @intCast(i)), v);
+    alloc.free(ints);
+
+    // u64
+    const longs = try alloc.alloc(u64, 50);
+    for (longs, 0..) |*v, i| v.* = @as(u64, i) * 0x100000001;
+    for (longs, 0..) |v, i| try std.testing.expectEqual(@as(u64, i) * 0x100000001, v);
+    alloc.free(longs);
+}
+
+test "correctness: Allocator.resize within block" {
+    const alloc = allocator();
+
+    const slice = try alloc.alloc(u8, 32);
+    @memset(slice, 0xDD);
+
+    // Resize within the same block should succeed
+    if (alloc.resize(slice, 16)) {
+        // Data still accessible in original range
+        for (slice[0..16]) |byte| {
+            try std.testing.expectEqual(@as(u8, 0xDD), byte);
+        }
+    }
+    alloc.free(slice);
+}
+
+test "correctness: Allocator.remap preserves data" {
+    const alloc = allocator();
+
+    const buf = try alloc.alloc(u8, 50);
+    for (buf, 0..) |*b, i| b.* = @truncate(i);
+
+    // remap to larger
+    if (alloc.remap(buf, 200)) |new_buf| {
+        for (0..50) |i| {
+            try std.testing.expectEqual(@as(u8, @truncate(i)), new_buf[i]);
+        }
+        alloc.free(new_buf);
+    } else {
+        alloc.free(buf);
+    }
+}
+
+test "leak: multi-threaded alloc-free symmetry" {
+    const num_threads = 8;
+    const ops = 2000;
+
+    var global_allocs = std.atomic.Value(usize).init(0);
+    var global_frees = std.atomic.Value(usize).init(0);
+    var errors = std.atomic.Value(usize).init(0);
+
+    const Worker = struct {
+        fn run(allocs: *std.atomic.Value(usize), frees: *std.atomic.Value(usize), errs: *std.atomic.Value(usize), seed: u64) void {
+            var prng = std.Random.DefaultPrng.init(seed);
+            const random = prng.random();
+            var local_ptrs: [64]?[*]u8 = [_]?[*]u8{null} ** 64;
+
+            for (0..ops) |_| {
+                const idx = random.uintLessThan(usize, 64);
+                if (local_ptrs[idx]) |ptr| {
+                    free_mem(ptr);
+                    local_ptrs[idx] = null;
+                    _ = frees.fetchAdd(1, .monotonic);
+                } else {
+                    const size = 8 + random.uintLessThan(usize, 2040);
+                    local_ptrs[idx] = malloc(size);
+                    if (local_ptrs[idx] != null) {
+                        _ = allocs.fetchAdd(1, .monotonic);
+                    } else {
+                        _ = errs.fetchAdd(1, .monotonic);
+                    }
+                }
+            }
+
+            // Cleanup
+            for (&local_ptrs) |*p| {
+                if (p.*) |ptr| {
+                    free_mem(ptr);
+                    p.* = null;
+                    _ = frees.fetchAdd(1, .monotonic);
+                }
+            }
+        }
+    };
+
+    var threads: [num_threads]std.Thread = undefined;
+    for (0..num_threads) |i| {
+        threads[i] = std.Thread.spawn(.{}, Worker.run, .{ &global_allocs, &global_frees, &errors, @as(u64, i) * 77777 }) catch return;
+    }
+    for (&threads) |*t| t.join();
+
+    const total_allocs = global_allocs.load(.monotonic);
+    const total_frees = global_frees.load(.monotonic);
+    const total_errors = errors.load(.monotonic);
+
+    // Every allocation must have been freed
+    try std.testing.expectEqual(total_allocs, total_frees);
+    try std.testing.expectEqual(@as(usize, 0), total_errors);
+}
+
+test "leak: cross-thread free doesn't leak" {
+    // Thread A allocates, thread B frees — no leaks
+    const N = 1000;
+    var shared: [N]std.atomic.Value(?[*]u8) = undefined;
+    for (&shared) |*s| s.* = std.atomic.Value(?[*]u8).init(null);
+
+    var alloc_done = std.atomic.Value(bool).init(false);
+
+    const Allocator = struct {
+        fn run(ptrs: []std.atomic.Value(?[*]u8), done: *std.atomic.Value(bool)) void {
+            for (ptrs, 0..) |*p, i| {
+                const size = 32 + (i % 64) * 16;
+                const ptr = malloc(size) orelse continue;
+                @memset(ptr[0..size], @as(u8, @truncate(i)));
+                p.store(ptr, .release);
+            }
+            done.store(true, .release);
+        }
+    };
+
+    const Freer = struct {
+        fn run(ptrs: []std.atomic.Value(?[*]u8), done: *std.atomic.Value(bool)) void {
+            var freed: usize = 0;
+            while (freed < ptrs.len) {
+                for (ptrs) |*p| {
+                    if (p.swap(null, .acq_rel)) |ptr| {
+                        free_mem(ptr);
+                        freed += 1;
+                    }
+                }
+                if (done.load(.acquire) and freed < ptrs.len) {
+                    // Drain remaining
+                    for (ptrs) |*p| {
+                        if (p.swap(null, .acq_rel)) |ptr| {
+                            free_mem(ptr);
+                            freed += 1;
+                        }
+                    }
+                }
+            }
+        }
+    };
+
+    const t1 = std.Thread.spawn(.{}, Allocator.run, .{ &shared, &alloc_done }) catch return;
+    const t2 = std.Thread.spawn(.{}, Freer.run, .{ &shared, &alloc_done }) catch return;
+    t1.join();
+    t2.join();
+}
+
+test "correctness: stress alloc-write-verify-free 50k ops" {
+    var prng = std.Random.DefaultPrng.init(0xCAFE_BABE);
+    const random = prng.random();
+
+    var ptrs: [256]?[*]u8 = [_]?[*]u8{null} ** 256;
+    var sizes_arr: [256]usize = [_]usize{0} ** 256;
+    var patterns: [256]u8 = [_]u8{0} ** 256;
+
+    for (0..50_000) |op| {
+        const idx = random.uintLessThan(usize, 256);
+        if (ptrs[idx]) |p| {
+            // Verify before free
+            const size = sizes_arr[idx];
+            const pat = patterns[idx];
+            for (p[0..size]) |byte| {
+                if (byte != pat) {
+                    std.debug.print("CORRUPTION at op {}, idx {}, expected 0x{x}, got 0x{x}\n", .{ op, idx, pat, byte });
+                    try std.testing.expect(false);
+                }
+            }
+            free_mem(p);
+            ptrs[idx] = null;
+        } else {
+            const size = 1 + random.uintLessThan(usize, 4095);
+            const pat: u8 = @truncate(op);
+            ptrs[idx] = malloc(size);
+            if (ptrs[idx]) |p| {
+                @memset(p[0..size], pat);
+                sizes_arr[idx] = size;
+                patterns[idx] = pat;
+            }
+        }
+    }
+
+    // Final cleanup
+    for (0..256) |i| {
+        if (ptrs[i]) |p| {
+            const pat = patterns[i];
+            for (p[0..sizes_arr[i]]) |byte| {
+                try std.testing.expectEqual(pat, byte);
+            }
+            free_mem(p);
+        }
+    }
+}
+
+test "correctness: stress all size classes sequentially" {
+    // Walk through every interesting size from 1 to 128 KiB
+    var size: usize = 1;
+    while (size <= 128 * types.KiB) {
+        const ptr = malloc(size) orelse {
+            size = if (size < 16) size + 1 else size + size / 4;
+            continue;
+        };
+        // Write first, middle, last (avoid overlap when size <= 2)
+        if (size >= 3) {
+            ptr[0] = 0xAA;
+            ptr[size / 2] = 0xBB;
+            ptr[size - 1] = 0xCC;
+            try std.testing.expectEqual(@as(u8, 0xAA), ptr[0]);
+            try std.testing.expectEqual(@as(u8, 0xBB), ptr[size / 2]);
+            try std.testing.expectEqual(@as(u8, 0xCC), ptr[size - 1]);
+        } else {
+            @memset(ptr[0..size], 0xDD);
+            for (ptr[0..size]) |byte| try std.testing.expectEqual(@as(u8, 0xDD), byte);
+        }
+        free_mem(ptr);
+
+        size = if (size < 16) size + 1 else size + size / 4;
+    }
 }

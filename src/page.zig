@@ -61,42 +61,32 @@ pub const Block = struct {
 pub const Page = struct {
     const Self = @This();
 
+    // === Cache line 0: hot allocation path ===
+    free: list.IntrusiveLifo(Block) = .init(), // free blocks (recycled + freed)
+    page_start: ?[*]u8 = null,
+    block_size: usize = 0,
+    capacity: u16 = 0, // max number of blocks
+    reserved: u16 = 0, // bump pointer position
+    used: u16 = 0, // blocks in use
+    block_size_shift: u8 = 0,
+    flags: Flags = .{},
+    // 8 + 8 + 8 + 2 + 2 + 2 + 1 + 1 = 32 bytes — fits first half of cache line
+
+    // === Cache line 0/1: less frequent fields ===
+    // local_free: list.IntrusiveLifo(Block) = list.IntrusiveLifo(Block).init(), // kept for xthread collection
+    xthread_free: Atomic(?*Block) = .init(null), // cross-thread free list (atomic)
+    next: ?*Page = null, // next page owned by this thread with the same `block_size`
+    prev: ?*Page = null,
+    _pad: [8]u8 = undefined,
+
     // Segment info
     segment_idx: u32 = 0, // index within segment
     slice_count: u32 = 0, // number of slices this page uses
     slice_offset: u32 = 0, // offset from segment start in slices
 
-    // Page metadata
-    capacity: u16 = 0, // max number of blocks
-    reserved: u16 = 0, // reserved blocks
-    used: u16 = 0, // blocks in use
-
-    flags: Flags = .{},
     retire_expire: u8 = 0,
-    block_size_shift: u8 = 0,
     heap_tag: u8 = 0,
-
-    // Free lists
-    free: list.IntrusiveLifo(Block) = list.IntrusiveLifo(Block).init(), // free blocks in this page
-    local_free: list.IntrusiveLifo(Block) = list.IntrusiveLifo(Block).init(), // thread-local free list
-
-    block_size: usize = 0,
-    page_start: ?[*]u8 = null,
-
-    // Extension configuration - calculated once at init
-    extend_threshold: u16 = 0, // Extend when free count drops below this
-    extend_batch: u16 = 0, // Number of blocks to extend at once
-
-    xthread_free: Atomic(?*Block) = .init(null), // cross-thread free list (atomic)
-
-    // intrusive linked list for page queues
-    next: ?*Page = null, // next page owned by this thread with the same `block_size`
-    prev: ?*Page = null,
-
-    // Segment usage flag
     segment_in_use: bool = false,
-
-    // Purge scheduling
     expire: i64 = 0, // expiration time for delayed purge
 
     pub const Flags = packed struct(u8) {
@@ -161,14 +151,13 @@ pub const Page = struct {
         self.block_size = block_size;
         self.page_start = page_start;
         self.used = 0;
-        self.free = list.IntrusiveLifo(Block).init();
-        self.local_free = list.IntrusiveLifo(Block).init();
+        self.free = .init();
         self.xthread_free.store(null, .release);
 
         // Calculate capacity
         if (block_size > 0 and page_size >= block_size) {
             self.capacity = @intCast(page_size / block_size);
-            self.reserved = 0; // Start with 0 reserved, will be extended as needed
+            self.reserved = 0; // Bump pointer starts at 0
         } else {
             self.capacity = 0;
             self.reserved = 0;
@@ -181,45 +170,9 @@ pub const Page = struct {
             self.block_size_shift = 0;
         }
 
-        // Calculate extension parameters based on capacity
-        // Minimize extendFree calls while keeping memory pressure reasonable
-        if (self.capacity > 0) {
-            // Extend batch: larger pages get larger batches
-            // Always capped at capacity to avoid over-extension
-            const cap = self.capacity;
-            var batch: u16 = undefined;
-
-            if (cap <= 8) {
-                // Very small pages (huge allocations): extend all at once
-                batch = cap;
-            } else if (cap <= 64) {
-                // Small pages: extend 1/4 of capacity, min 8
-                batch = @intCast(@max(8, cap / 4));
-            } else if (cap <= 256) {
-                // Medium pages: extend 1/8 of capacity, min 32
-                batch = @intCast(@max(32, cap / 8));
-            } else {
-                // Large pages: extend 1/16 of capacity, min 64, max 256
-                batch = @intCast(@min(256, @max(64, cap / 16)));
-            }
-
-            // Ensure batch never exceeds capacity
-            self.extend_batch = @min(batch, cap);
-
-            // Threshold: extend when free count drops below this
-            // For small capacities, use capacity/2; otherwise 2x batch or capacity/4
-            if (cap <= 16) {
-                self.extend_threshold = cap / 2;
-            } else {
-                self.extend_threshold = @min(self.extend_batch * 2, cap / 4);
-            }
-        } else {
-            self.extend_batch = 0;
-            self.extend_threshold = 0;
-        }
-
         self.flags.free_is_zero = self.flags.is_zero_init;
         self.retire_expire = 0;
+        // Bump pointer handles initial allocation - no pre-extension needed
     }
 
     // =========================================================================
@@ -252,45 +205,27 @@ pub const Page = struct {
         var i: usize = actual_extend;
         while (i > 0) : (i -= 1) {
             const block: *Block = @ptrCast(@alignCast(block_start + (i - 1) * bsize));
+            @prefetch(block, .{ .cache = .data, .locality = 3, .rw = .read });
             self.free.push(block);
         }
 
         self.reserved += @intCast(actual_extend);
     }
 
-    /// Extend free list using the page's configured batch size
-    /// Returns true if extension happened
-    pub inline fn extendFreeAuto(self: *Self) bool {
-        if (self.reserved >= self.capacity) return false;
-        const batch = if (self.extend_batch > 0) self.extend_batch else 16;
-        const remaining = self.capacity - self.reserved;
-        const extend = @min(batch, remaining);
-        if (extend == 0) return false;
-        self.extendFree(extend);
-        return true;
-    }
-
-    /// Check if free list needs extension (below threshold)
-    /// Uses O(1) calculation: free_count = reserved - used
-    pub inline fn needsExtension(self: *const Self) bool {
-        if (self.reserved >= self.capacity) return false;
-        // Approximate free count = reserved - used
-        // This doesn't account for local_free/xthread_free but is fast
-        const approx_free = if (self.reserved > self.used) self.reserved - self.used else 0;
-        return approx_free < self.extend_threshold;
-    }
-
-    /// Check if page has any free blocks
+    /// Check if page has any free blocks (including bump pointer room)
     pub inline fn hasFree(self: *const Self) bool {
-        // Check thread-local lists first (cheap)
-        if (!self.free.empty() or !self.local_free.empty()) {
-            @branchHint(.likely);
-            return true;
-        } else {
-            // Only check xthread if local lists are empty (cold path)
-            @branchHint(.unlikely);
-            return self.xthread_free.load(.monotonic) != null;
-        }
+        // Bump pointer has room (cheapest check - register comparison)
+        if (self.reserved < self.capacity) return true;
+        // Free list (recycled + same-thread freed blocks)
+        if (!self.free.empty()) return true;
+        // Cross-thread free list (cold path)
+        return self.xthread_free.load(.monotonic) != null;
+    }
+
+    /// Quick check without atomic xthread load — for hot allocation path.
+    /// Cross-thread freed blocks will be collected on next popFreeBlockSlow().
+    pub inline fn hasFreeQuick(self: *const Self) bool {
+        return self.reserved < self.capacity or !self.free.empty();
     }
 
     /// Check if all blocks are used
@@ -305,13 +240,13 @@ pub const Page = struct {
         return self.used <= self.capacity / 8;
     }
 
-    /// Collect thread-local free list into main free list
-    pub inline fn collectLocalFree(self: *Self) void {
-        // Move all from local_free to free
-        while (self.local_free.pop()) |block| {
-            self.free.push(block);
-        }
-    }
+    // /// Collect thread-local free list into main free list
+    // pub inline fn collectLocalFree(self: *Self) void {
+    //     // Move all from local_free to free
+    //     while (self.local_free.pop()) |block| {
+    //         self.free.push(block);
+    //     }
+    // }
 
     /// Collect cross-thread free list (atomic)
     pub inline fn collectXthreadFree(self: *Self) usize {
@@ -326,8 +261,8 @@ pub const Page = struct {
             else
                 null;
 
-            // Clear link before pushing (required by IntrusiveLifo.push assertion)
-            block.link.next = null;
+            @prefetch(block, .{ .cache = .data, .locality = 3, .rw = .read });
+
             self.free.push(block);
             head = next;
             count += 1;
@@ -366,33 +301,33 @@ pub const Page = struct {
         }
     }
 
-    /// Pop a free block - hot path
+    /// Pop a free block - hot path with bump pointer
     pub inline fn popFreeBlock(self: *Self) ?*Block {
-        // Hot path: pop from free list
+        // Hot path 1: pop from free list (recycled blocks)
         if (self.free.pop()) |block| {
+            @branchHint(.likely);
             self.used += 1;
             return block;
         }
 
-        // Cold path: collect local_free into free, then retry
+        // Hot path 2: bump allocate fresh contiguous block (no cache miss)
+        if (self.reserved < self.capacity) {
+            @branchHint(.likely);
+            const start = self.page_start orelse return self.popFreeBlockSlow();
+            const next_offset = self.reserved * self.block_size;
+            @prefetch(start + next_offset, .{ .cache = .data, .locality = 3, .rw = .write });
+            const block: *Block = @ptrCast(@alignCast(start + @as(usize, self.reserved) * self.block_size));
+            self.reserved += 1;
+            self.used += 1;
+            return block;
+        }
+
+        // Cold path: collect local_free/xthread_free
         return self.popFreeBlockSlow();
     }
 
     inline fn popFreeBlockSlow(self: *Self) ?*Block {
-        // Move local_free to free
-        if (!self.local_free.empty()) {
-            // Swap the lists - local_free becomes new free
-            const temp = self.free;
-            self.free = self.local_free;
-            self.local_free = temp;
-
-            if (self.free.pop()) |block| {
-                self.used += 1;
-                return block;
-            }
-        }
-
-        // Try to collect xthread free
+        // Try to collect cross-thread free blocks
         if (self.collectXthreadFree() > 0) {
             if (self.free.pop()) |block| {
                 self.used += 1;
@@ -402,9 +337,9 @@ pub const Page = struct {
         return null;
     }
 
-    /// Push freed block to local_free (write path separate from read path)
+    /// Push freed block directly to free list (same-thread, no swap needed)
     pub inline fn pushFreeBlock(self: *Self, block: *Block) void {
-        self.local_free.push(block);
+        self.free.push(block);
         self.used -|= 1;
     }
 
@@ -412,7 +347,7 @@ pub const Page = struct {
     pub fn reset(self: *Self) void {
         self.used = 0;
         self.free = list.IntrusiveLifo(Block).init();
-        self.local_free = list.IntrusiveLifo(Block).init();
+        // self.local_free = list.IntrusiveLifo(Block).init();
         self.xthread_free.store(null, .release);
         self.reserved = 0;
         self.retire_expire = 0;
@@ -424,11 +359,10 @@ pub const Page = struct {
         return self.isMostlyEmpty() and !self.is_in_full();
     }
 
-    /// Get number of free blocks
+    /// Get number of free blocks (includes bump-available)
     pub fn freeCount(self: *const Self) usize {
-        // Use the count() method which tracks the count
-        return self.free.count() + self.local_free.count();
-        // Note: xthread_free not counted as it requires atomic access
+        const bump_available: usize = if (self.capacity > self.reserved) self.capacity - self.reserved else 0;
+        return self.free.count() + bump_available;
     }
 
     /// Get utilization ratio (0.0 to 1.0)
@@ -629,13 +563,10 @@ test "Page: hasFree and allUsed" {
     var buffer: [128]u8 align(16) = undefined;
 
     page.init(32, &buffer, 128);
-    page.reserved = 0;
-
-    try testing.expect(!page.hasFree()); // No free blocks yet
-    page.extendFree(4);
+    // capacity=4 (128/32), reserved=0, so bump has room
     try testing.expect(page.hasFree());
 
-    // Use all blocks
+    // Use all blocks via bump allocation
     _ = page.popFreeBlock();
     _ = page.popFreeBlock();
     _ = page.popFreeBlock();
@@ -748,7 +679,7 @@ test "queueFindFree" {
     var queue: Page.Queue = .{};
     var buffer: [64]u8 align(8) = undefined;
 
-    var p1: Page = .{ .capacity = 10, .used = 10 }; // Full
+    var p1: Page = .{ .capacity = 10, .used = 10, .reserved = 10 }; // Full (bump exhausted)
     var p2: Page = .{ .capacity = 10, .used = 5 }; // Partially used
     p2.init(8, &buffer, 64);
     p2.reserved = 0;

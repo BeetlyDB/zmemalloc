@@ -8,6 +8,7 @@ const types = @import("types.zig");
 const builtin = @import("builtin");
 const Atomic = std.atomic.Value;
 const testing = std.testing;
+const config = @import("config");
 
 pub const DEFAULT_PHYSICAL_MEMORY_IN_KIB = if (types.INTPTR_SIZE < 8) 4 * types.MiB else 8 * types.MiB;
 pub const DEFAULT_VIRTUAL_ADDRESS = if (types.INTPTR_SIZE < 8) 32 else 48;
@@ -16,15 +17,15 @@ var reset_advice: Atomic(u32) = .{ .raw = if (@hasDecl(posix.MADV, "FREE")) posi
 
 pub const OsMemConfig = struct {
     const Self = @This();
-    page_size: usize = std.heap.page_size_min,
+    page_size: usize = config.Config.page_size,
     large_page_size: usize = std.heap.page_size_max,
     allocation_granularity: usize = std.heap.page_size_min,
-    physical_memory_kib: usize = DEFAULT_PHYSICAL_MEMORY_IN_KIB,
+    physical_memory_kib: usize = config.Config.physical_memory_kib,
     virtual_address_bits: usize = DEFAULT_VIRTUAL_ADDRESS,
-    has_overcommit: bool = true,
+    has_overcommit: bool = config.Config.has_overcommit,
     has_partial_free: bool = true,
     has_virtual_reserve: bool = true,
-    thp: ThpMode = .thp_mode_always,
+    thp: ThpMode = if (config.Config.thp) .thp_mode_always else .thp_mode_default,
     has_numa_available: bool = false,
     numa_nodes: usize = 1,
 
@@ -33,29 +34,21 @@ pub const OsMemConfig = struct {
         thp_mode_always, // Always set MADV_HUGEPAGE. */
     };
 
-    pub inline fn init(cfg: *Self) void { //TODO: make init in comptime and get in static
-        cfg.page_size = std.heap.pageSize();
-        cfg.allocation_granularity = cfg.page_size;
+    //WARN: numa does not have support right now
 
-        cfg.physical_memory_kib = phisical_memory() orelse DEFAULT_PHYSICAL_MEMORY_IN_KIB;
-
-        cfg.has_overcommit = unix_detect_overcommit();
-        cfg.has_partial_free = true; //mmap can free in parts
-        cfg.has_virtual_reserve = true; //always true for linux
-        cfg.thp = unix_detect_thp();
-        const numa = unix_detect_numa();
-        cfg.has_numa_available = numa.has_numa;
-        cfg.numa_nodes = numa.node_count;
-        cfg.virtual_address_bits = DEFAULT_VIRTUAL_ADDRESS;
-    }
+    // pub inline fn init(cfg: *Self) void { //TODO: make init in comptime and get in static
+    //     cfg.page_size = std.heap.pageSize();
+    //     cfg.allocation_granularity = cfg.page_size;
+    //
+    //     cfg.physical_memory_kib = phisical_memory() orelse DEFAULT_PHYSICAL_MEMORY_IN_KIB;
+    //
+    //     cfg.has_overcommit = unix_detect_overcommit();
+    //     cfg.has_partial_free = true; //mmap can free in parts
+    //     cfg.has_virtual_reserve = true; //always true for linux
+    //     cfg.thp = unix_detect_thp();
+    //     cfg.virtual_address_bits = DEFAULT_VIRTUAL_ADDRESS;
+    // }
 };
-
-inline fn phisical_memory() ?usize {
-    var info: linux.Sysinfo = undefined;
-    if (linux.sysinfo(&info) != 0) return null;
-
-    return (@as(usize, info.totalram) * info.mem_unit) / 1024;
-}
 
 pub const mem_config_static: OsMemConfig = .{};
 
@@ -153,21 +146,6 @@ pub inline fn os_use_large_page(size: usize, alignment: usize) bool {
     return (size % mem_config_static.large_page_size == 0) and (alignment % mem_config_static.large_page_size == 0);
 }
 
-pub fn unix_detect_overcommit() bool {
-    var os_overcommited: bool = true;
-
-    const fd = posix.open("/proc/sys/vm/overcommit_memory", .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0) catch return os_overcommited;
-    defer posix.close(fd);
-    var buf: [32]u8 = undefined;
-    const nread = posix.read(fd, &buf) catch return os_overcommited;
-    if (nread >= 1) {
-        // <https://www.kernel.org/doc/Documentation/vm/overcommit-accounting>
-        os_overcommited = buf[0] == '0' or buf[0] == '1';
-    }
-
-    return os_overcommited;
-}
-
 const NumaInfo = struct {
     has_numa: bool,
     node_count: usize,
@@ -189,26 +167,6 @@ pub fn unix_detect_numa() NumaInfo {
         return .{ .has_numa = true, .node_count = node_count };
     }
     return .{ .has_numa = false, .node_count = 1 };
-}
-
-pub inline fn unix_detect_thp() OsMemConfig.ThpMode {
-    const sys_state_always = "[always] madvise never\n";
-
-    const fd = posix.open("/sys/kernel/mm/transparent_hugepage/enabled", .{ .ACCMODE = .RDONLY }, 0) catch return .thp_mode_default;
-    defer posix.close(fd);
-    var buf: [32]u8 = undefined;
-
-    const nread = posix.read(fd, &buf) catch return .thp_mode_default;
-
-    if (nread > 1) {
-        if (std.mem.eql(u8, sys_state_always, buf[0..])) {
-            return .thp_mode_always;
-        } else {
-            return .thp_mode_default;
-        }
-    } else {
-        return .thp_mode_default;
-    }
 }
 
 pub inline fn os_good_size(size: usize) usize {
