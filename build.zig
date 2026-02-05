@@ -135,9 +135,9 @@ pub fn build(b: *std.Build) void {
     });
     strip_step(exe);
 
-    b.installArtifact(exe);
+    // b.installArtifact(exe);
 
-    const run_step = b.step("run", "Run the app");
+    const run_step = b.step("bench", "Run the bench");
 
     const run_cmd = b.addRunArtifact(exe);
     run_step.dependOn(&run_cmd.step);
