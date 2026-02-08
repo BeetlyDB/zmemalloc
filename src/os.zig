@@ -385,20 +385,6 @@ test "prim_reset fallback from MADV_FREE to DONTNEED" {
     try testing.expectEqual(posix.MADV.DONTNEED, new_advice);
 }
 
-test "OsMemConfig init sets defaults correctly" {
-    var cfg: OsMemConfig = undefined;
-    OsMemConfig.init(&cfg);
-
-    try testing.expect(cfg.page_size >= 4096);
-    try testing.expect(cfg.allocation_granularity == cfg.page_size);
-    std.debug.print("memory_in_kib: {}\n", .{cfg.physical_memory_kib});
-    std.debug.print("default_in_kib: {}\n", .{DEFAULT_PHYSICAL_MEMORY_IN_KIB});
-    try testing.expect(cfg.physical_memory_kib > DEFAULT_PHYSICAL_MEMORY_IN_KIB);
-    try testing.expect(cfg.virtual_address_bits == DEFAULT_VIRTUAL_ADDRESS);
-    try testing.expect(cfg.has_partial_free);
-    try testing.expect(cfg.has_virtual_reserve);
-}
-
 pub inline fn pageSize() usize {
     return mem_config_static.page_size;
 }

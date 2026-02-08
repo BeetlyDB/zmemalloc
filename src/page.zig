@@ -73,7 +73,7 @@ pub const Page = struct {
     // 8 + 8 + 8 + 2 + 2 + 2 + 1 + 1 = 32 bytes — fits first half of cache line
 
     // === Cache line 0/1: less frequent fields ===
-    // local_free: list.IntrusiveLifo(Block) = list.IntrusiveLifo(Block).init(), // kept for xthread collection
+    local_free: list.IntrusiveLifo(Block) = list.IntrusiveLifo(Block).init(), // kept for xthread collection
     xthread_free: Atomic(?*Block) = .init(null), // cross-thread free list (atomic)
     next: ?*Page = null, // next page owned by this thread with the same `block_size`
     prev: ?*Page = null,
@@ -152,6 +152,7 @@ pub const Page = struct {
         self.page_start = page_start;
         self.used = 0;
         self.free = .init();
+        self.local_free = .init();
         self.xthread_free.store(null, .release);
 
         // Calculate capacity
@@ -228,6 +229,14 @@ pub const Page = struct {
         return self.reserved < self.capacity or !self.free.empty();
     }
 
+    /// Collect thread-local free list into main free list
+    pub inline fn collectLocalFree(self: *Self) void {
+        // Move all from local_free to free
+        while (self.local_free.pop()) |block| {
+            self.free.push(block);
+        }
+    }
+
     /// Check if all blocks are used
     pub inline fn allUsed(self: *const Self) bool {
         return self.used >= self.capacity;
@@ -239,14 +248,6 @@ pub const Page = struct {
         // Consider page empty if less than 1/8 used
         return self.used <= self.capacity / 8;
     }
-
-    // /// Collect thread-local free list into main free list
-    // pub inline fn collectLocalFree(self: *Self) void {
-    //     // Move all from local_free to free
-    //     while (self.local_free.pop()) |block| {
-    //         self.free.push(block);
-    //     }
-    // }
 
     /// Collect cross-thread free list (atomic)
     pub inline fn collectXthreadFree(self: *Self) usize {
@@ -327,6 +328,18 @@ pub const Page = struct {
     }
 
     inline fn popFreeBlockSlow(self: *Self) ?*Block {
+        // Move local_free to free
+        if (!self.local_free.empty()) {
+            // Swap the lists - local_free becomes new free
+            const temp = self.free;
+            self.free = self.local_free;
+            self.local_free = temp;
+            if (self.free.pop()) |block| {
+                @branchHint(.likely);
+                self.used += 1;
+                return block;
+            }
+        }
         // Try to collect cross-thread free blocks
         if (self.collectXthreadFree() > 0) {
             if (self.free.pop()) |block| {
@@ -339,15 +352,16 @@ pub const Page = struct {
 
     /// Push freed block directly to free list (same-thread, no swap needed)
     pub inline fn pushFreeBlock(self: *Self, block: *Block) void {
-        self.free.push(block);
+        // self.free.push(block);
+        self.local_free.push(block);
         self.used -|= 1;
     }
 
     /// Reset page to initial state
     pub fn reset(self: *Self) void {
         self.used = 0;
-        self.free = list.IntrusiveLifo(Block).init();
-        // self.local_free = list.IntrusiveLifo(Block).init();
+        self.free = .init();
+        self.local_free = .init();
         self.xthread_free.store(null, .release);
         self.reserved = 0;
         self.retire_expire = 0;
@@ -360,13 +374,13 @@ pub const Page = struct {
     }
 
     /// Get number of free blocks (includes bump-available)
-    pub fn freeCount(self: *const Self) usize {
+    pub inline fn freeCount(self: *const Self) usize {
         const bump_available: usize = if (self.capacity > self.reserved) self.capacity - self.reserved else 0;
-        return self.free.count() + bump_available;
+        return self.free.count() + self.local_free.count() + bump_available;
     }
 
     /// Get utilization ratio (0.0 to 1.0)
-    pub fn utilization(self: *const Self) f32 {
+    pub inline fn utilization(self: *const Self) f32 {
         if (self.capacity == 0) return 0.0;
         return @as(f32, @floatFromInt(self.used)) / @as(f32, @floatFromInt(self.capacity));
     }

@@ -181,6 +181,7 @@ pub const Segment = struct {
         pg.flags.is_commited = true;
         pg.used = 0;
         pg.free = .init();
+        pg.local_free = .init();
         pg.flags.is_zero_init = false;
         return true;
     }
@@ -190,7 +191,8 @@ pub const Segment = struct {
         pg.segment_in_use = false;
         pg.flags.page_flags = .{};
         pg.xthread_free.store(null, .release);
-        pg.free = queue.IntrusiveLifo(page_mod.Block).init();
+        pg.free = .init();
+        pg.local_free = .init();
         pg.block_size = 0;
         pg.page_start = null;
         pg.capacity = 0;
@@ -719,6 +721,7 @@ pub const SegmentsTLD = struct {
             pg.reserved = 0;
             pg.used = 0;
             pg.free = .init();
+            pg.local_free = .init();
             pg.xthread_free.store(null, .release);
             pg.next = null;
             pg.prev = null;
@@ -767,6 +770,7 @@ pub const SegmentsTLD = struct {
             pg.reserved = 0;
             pg.used = 0;
             pg.free = .init();
+            pg.local_free = .init();
             pg.xthread_free.store(null, .release);
             pg.next = null;
             pg.prev = null;
@@ -971,7 +975,7 @@ pub const SegmentsTLD = struct {
     }
 
     /// Free a huge page
-    pub fn freeHugePage(self: *Self, pg: *Page) void {
+    pub inline fn freeHugePage(self: *Self, pg: *Page) void {
         assert(pg.flags.is_huge);
         const segment = Segment.fromPtr(pg);
         self.freeSegment(segment, true);

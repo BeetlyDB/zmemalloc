@@ -14,5 +14,5 @@ perf:
 
 
 bench:
-	@zig build -Doptimize=ReleaseFast 2>&1 && ./zig-out/bin/zmemalloc     
+	@zig build bench -Doptimize=ReleaseFast 2>&1
 
