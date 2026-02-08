@@ -77,7 +77,6 @@ pub const Page = struct {
     xthread_free: Atomic(?*Block) = .init(null), // cross-thread free list (atomic)
     next: ?*Page = null, // next page owned by this thread with the same `block_size`
     prev: ?*Page = null,
-    _pad: [8]u8 = undefined,
 
     // Segment info
     segment_idx: u32 = 0, // index within segment
@@ -188,7 +187,7 @@ pub const Page = struct {
     }
 
     /// Extend free list by adding more blocks
-    pub fn extendFree(self: *Self, extend_count: usize) void {
+    pub inline fn extendFree(self: *Self, extend_count: usize) void {
         if (extend_count == 0) return;
         const start = self.page_start orelse return;
         const bsize = self.block_size;
@@ -251,7 +250,7 @@ pub const Page = struct {
 
     /// Collect cross-thread free list (atomic)
     pub inline fn collectXthreadFree(self: *Self) usize {
-        var head = self.xthread_free.swap(null, .acq_rel);
+        var head = self.xthread_free.swap(null, .monotonic);
         var count: usize = 0;
 
         while (head) |block| {
@@ -330,6 +329,7 @@ pub const Page = struct {
     inline fn popFreeBlockSlow(self: *Self) ?*Block {
         // Move local_free to free
         if (!self.local_free.empty()) {
+            @branchHint(.likely);
             // Swap the lists - local_free becomes new free
             const temp = self.free;
             self.free = self.local_free;
@@ -340,6 +340,7 @@ pub const Page = struct {
                 return block;
             }
         }
+
         // Try to collect cross-thread free blocks
         if (self.collectXthreadFree() > 0) {
             if (self.free.pop()) |block| {
@@ -347,6 +348,19 @@ pub const Page = struct {
                 return block;
             }
         }
+
+        // If still empty and bump available, extend a batch
+        if (self.free.empty() and self.reserved < self.capacity) {
+            @branchHint(.unlikely);
+            const BATCH_EXTEND: usize = 32;
+            const extend = @min(BATCH_EXTEND, self.capacity - self.reserved);
+            self.extendFree(extend);
+            if (self.free.pop()) |block| {
+                self.used += 1;
+                return block;
+            }
+        }
+
         return null;
     }
 
@@ -358,7 +372,7 @@ pub const Page = struct {
     }
 
     /// Reset page to initial state
-    pub fn reset(self: *Self) void {
+    pub inline fn reset(self: *Self) void {
         self.used = 0;
         self.free = .init();
         self.local_free = .init();

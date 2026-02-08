@@ -921,12 +921,12 @@ pub const SegmentsTLD = struct {
     }
 
     /// Get current segment count within target
-    pub fn isWithinTarget(self: *const Self, target: usize) bool {
+    pub inline fn isWithinTarget(self: *const Self, target: usize) bool {
         return self.count <= target;
     }
 
     /// Reduce memory usage by freeing empty segments
-    pub fn reduceMemory(self: *Self, target_count: usize) usize {
+    pub inline fn reduceMemory(self: *Self, target_count: usize) usize {
         var freed: usize = 0;
 
         // Free empty segments from small queue
@@ -982,7 +982,7 @@ pub const SegmentsTLD = struct {
     }
 
     /// Reset huge page memory (decommit/recommit for zeroing)
-    pub fn resetHugePage(self: *Self, pg: *Page) void {
+    pub inline fn resetHugePage(self: *Self, pg: *Page) void {
         _ = self;
         assert(pg.flags.is_huge);
         const segment = Segment.fromPtr(pg);
@@ -992,7 +992,7 @@ pub const SegmentsTLD = struct {
 
         // Use madvise to reset memory
         const ptr: [*]align(std.heap.page_size_min) u8 = @alignCast(start);
-        std.posix.madvise(ptr, psize, std.posix.MADV.DONTNEED) catch {};
+        std.posix.madvise(ptr, psize, std.posix.MADV.FREE) catch {};
         pg.flags.is_zero_init = true;
     }
 

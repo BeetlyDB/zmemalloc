@@ -201,6 +201,7 @@ pub fn main() !void {
     });
 
     bench();
+    multiThreadBench();
 }
 
 fn bench() void {
@@ -305,4 +306,86 @@ fn bench() void {
     }
 
     std.debug.print("\n", .{});
+}
+
+fn multiThreadBench() void {
+    const num_threads = 12;
+    const num_ptrs = 10000;
+    const iterations = 1000;
+    std.debug.print("\n=== Multi-Threaded Mixed Workload Benchmark ===\n", .{});
+    std.debug.print("Threads: {}\n", .{num_threads});
+    std.debug.print("Per thread: alloc {}, free random half, alloc again, free all\n", .{num_ptrs});
+    std.debug.print("Iterations per thread: {}\n\n", .{iterations});
+    // zmemalloc
+    const zmem_time = timedMultiThreadBench(zmemalloc.allocator(), num_threads, num_ptrs, iterations);
+    // smp_allocator
+    const smp_time = timedMultiThreadBench(std.heap.smp_allocator, num_threads, num_ptrs, iterations);
+    // mimalloc
+    const mimalloc_time = timedMultiThreadBench(mimalloc.mimalloc_allocator, num_threads, num_ptrs, iterations);
+    // c_allocator
+    const c_time = timedMultiThreadBench(std.heap.c_allocator, num_threads, num_ptrs, iterations);
+    const zmem_ms = @as(f64, @floatFromInt(zmem_time)) / 1_000_000.0;
+    const smp_ms = @as(f64, @floatFromInt(smp_time)) / 1_000_000.0;
+    const mi_ms = @as(f64, @floatFromInt(mimalloc_time)) / 1_000_000.0;
+    const c_ms = @as(f64, @floatFromInt(c_time)) / 1_000_000.0;
+    const smp_speedup = if (zmem_ms > 0) smp_ms / zmem_ms else 0.0;
+    const mi_speedup = if (zmem_ms > 0) mi_ms / zmem_ms else 0.0;
+    const c_speedup = if (zmem_ms > 0) c_ms / zmem_ms else 0.0;
+    std.debug.print("{s:<15}: {d:>10.2} ms\n", .{ "zmemalloc", zmem_ms });
+    std.debug.print("{s:<15}: {d:>10.2} ms ({d:.2}x)\n", .{
+        "smp_allocator", smp_ms, smp_speedup,
+    });
+    std.debug.print("{s:<15}: {d:>10.2} ms ({d:.2}x)\n", .{
+        "mimalloc", mi_ms, mi_speedup,
+    });
+    std.debug.print("{s:<15}: {d:>10.2} ms ({d:.2}x)\n\n", .{
+        "c_allocator", c_ms, c_speedup,
+    });
+}
+
+fn timedMultiThreadBench(alloc: std.mem.Allocator, comptime num_threads: usize, comptime num_ptrs: usize, comptime iterations: usize) u64 {
+    var threads: [num_threads]std.Thread = undefined;
+    var timer = std.time.Timer.start() catch return 0;
+    for (0..num_threads) |i| {
+        threads[i] = std.Thread.spawn(.{}, threadWorkload, .{ alloc, num_ptrs, iterations }) catch |err| {
+            std.debug.print("Failed to spawn thread {}: {}\n", .{ i, err });
+            continue;
+        };
+    }
+    for (threads) |th| {
+        th.join();
+    }
+    return timer.read();
+}
+
+fn threadWorkload(alloc: std.mem.Allocator, comptime num_ptrs: usize, iterations: usize) void {
+    var local_prng = std.Random.DefaultPrng.init(@as(u64, std.Thread.getCurrentId()));
+    const random = local_prng.random();
+    for (0..iterations) |_| {
+        var ptrs: [num_ptrs]?[]u8 = undefined;
+        @memset(&ptrs, null);
+        // Allocate all
+        for (&ptrs) |*p| {
+            const size = 16 + random.uintLessThan(usize, 1024);
+            p.* = alloc.alloc(u8, size) catch null;
+        }
+        // Free random half
+        for (&ptrs) |*p| {
+            if (random.boolean()) {
+                if (p.*) |slice| alloc.free(slice);
+                p.* = null;
+            }
+        }
+        // Allocate again into freed slots
+        for (&ptrs) |*p| {
+            if (p.* == null) {
+                const size = 16 + random.uintLessThan(usize, 1024);
+                p.* = alloc.alloc(u8, size) catch null;
+            }
+        }
+        // Free all
+        for (ptrs) |p| {
+            if (p) |slice| alloc.free(slice);
+        }
+    }
 }

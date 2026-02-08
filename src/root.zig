@@ -575,7 +575,7 @@ pub fn collect(force: bool) usize {
     // Note: We iterate a copy to avoid issues during clearing
     var pages_to_check: [types.PAGES_DIRECT]?*Page = undefined;
     inline for (&heap.pages_free_direct, 0..) |direct, i| {
-        @setEvalBranchQuota(10_000);
+        @setEvalBranchQuota(10_0000);
         pages_to_check[i] = direct;
     }
 
@@ -681,6 +681,7 @@ pub fn reclaimAbandoned(max_count: usize) usize {
     if (!global_subproc.abandoned_os_visit_lock.trylock()) {
         return 0;
     }
+
     defer global_subproc.abandoned_os_visit_lock.unlock();
 
     var reclaimed: usize = 0;
