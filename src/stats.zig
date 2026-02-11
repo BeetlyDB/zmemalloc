@@ -2,7 +2,7 @@ const std = @import("std");
 const assert = @import("util.zig").assert;
 const types = @import("types.zig");
 
-const BIN_HUGE = 73;
+const BIN_HUGE = types.BIN_HUGE;
 
 // count allocation over time
 pub const StatCount = struct {

@@ -4,16 +4,86 @@ const types = @import("types.zig");
 const queue = @import("queue.zig");
 const page_mod = @import("page.zig");
 const MemID = @import("mem.zig").MemID;
-const Stats = @import("stats.zig").Stats;
 const OsAllocator = @import("os_allocator.zig");
 const arena_mod = @import("arena.zig");
 const util = @import("util.zig");
 const os_mod = @import("os.zig");
 const assert = util.assert;
 const subproc_m = @import("subproc.zig");
+const Mutex = @import("mutex.zig").Mutex;
 
 const Atomic = std.atomic.Value;
 const Page = page_mod.Page;
+
+/// Registry for tracking huge segments (> 32MB).
+/// This allows fromPtr to find the correct segment for pointers > 32MB into an allocation.
+/// TODO: handle mor huge segments and use map instead of linier search of array
+pub const HugeSegmentRegistry = struct {
+    const MAX_HUGE_SEGMENTS: usize = 512;
+
+    entries: [MAX_HUGE_SEGMENTS]Entry = [_]Entry{.{}} ** MAX_HUGE_SEGMENTS,
+    count: Atomic(usize) = Atomic(usize).init(0),
+
+    lock: Mutex = .{},
+
+    const Entry = struct {
+        start: usize = 0, // Segment start address
+        end: usize = 0, // Segment end address (start + segment_size)
+        segment: ?*Segment = null,
+    };
+
+    /// Register a huge segment
+    pub fn register(self: *HugeSegmentRegistry, segment: *Segment) void {
+        self.lock.lock();
+        defer self.lock.unlock();
+
+        const idx = self.count.load(.acquire);
+        if (idx >= MAX_HUGE_SEGMENTS) return; // Registry full
+
+        const start = @intFromPtr(segment);
+        self.entries[idx] = .{
+            .start = start,
+            .end = start + segment.segment_size,
+            .segment = segment,
+        };
+        self.count.store(idx + 1, .release);
+    }
+
+    /// Unregister a huge segment
+    pub fn unregister(self: *HugeSegmentRegistry, segment: *Segment) void {
+        self.lock.lock();
+        defer self.lock.unlock();
+
+        const target = @intFromPtr(segment);
+        const cnt = self.count.load(.acquire);
+        for (0..cnt) |i| {
+            if (self.entries[i].start == target) {
+                // Move last entry to this slot
+                if (i < cnt - 1) {
+                    self.entries[i] = self.entries[cnt - 1];
+                }
+                self.entries[cnt - 1] = .{};
+                self.count.store(cnt - 1, .release);
+                return;
+            }
+        }
+    }
+
+    /// Find segment containing the given address
+    pub fn find(self: *HugeSegmentRegistry, addr: usize) ?*Segment {
+        const cnt = self.count.load(.acquire);
+        for (0..cnt) |i| {
+            const entry = self.entries[i];
+            if (addr >= entry.start and addr < entry.end) {
+                return entry.segment;
+            }
+        }
+        return null;
+    }
+};
+
+/// Global registry for huge segments
+var huge_registry: HugeSegmentRegistry = .{};
 
 // =============================================================================
 // Segment Structure
@@ -104,7 +174,7 @@ pub const Segment = struct {
         const info_slices = (self.segment_info_size + psize_raw - 1) / psize_raw;
 
         // Actual page index accounting for header slices
-        const effective_idx = pg.segment_idx + info_slices;
+        const effective_idx = pg.segment_idx() + info_slices;
         const p = base + effective_idx * psize_raw;
 
         if (page_size_out) |ps| ps.* = psize_raw;
@@ -133,9 +203,29 @@ pub const Segment = struct {
     // Pointer to Segment/Page
     // =========================================================================
 
-    /// Get segment from any pointer within it
+    /// Get segment from any pointer within it.
+    /// For huge segments (> 32MB), uses a global registry to find the correct segment.
     pub inline fn fromPtr(p: *const anyopaque) *Self {
-        return @ptrFromInt(@intFromPtr(p) & ~types.SEGMENT_MASK);
+        const addr = @intFromPtr(p);
+        const masked = addr & ~types.SEGMENT_MASK;
+        const candidate: *Self = @ptrFromInt(masked);
+
+        // Check if this segment contains our pointer
+        // For non-huge segments, segment_size == SEGMENT_SIZE and this always works
+        // For huge segments, we need to verify the pointer is within bounds
+        if (masked + candidate.segment_size > addr) {
+            @branchHint(.likely);
+            return candidate;
+        }
+
+        // Slow path: pointer is > 32MB into a huge segment
+        // Use the global registry to find the correct segment
+        if (huge_registry.find(addr)) |segment| {
+            @branchHint(.cold);
+            return segment;
+        }
+
+        return candidate;
     }
 
     /// Get page from pointer (within segment's data area) - optimized
@@ -143,12 +233,25 @@ pub const Segment = struct {
         return pageFromPtrWithSegment(fromPtr(p), p);
     }
 
-    /// Get page when segment is already known (avoids duplicate lookup)
+    /// Get page when segment is already known - optimized
+    /// Uses comptime shifts for small/medium (most common), avoids page_shift load
     pub inline fn pageFromPtrWithSegment(segment: *Self, p: *const anyopaque) *Page {
+        // Large/huge pages: capacity == 1, always page 0
+        if (segment.capacity == 1) {
+            @branchHint(.unlikely);
+            return &segment.pages[0];
+        }
+
         const diff = @intFromPtr(p) - @intFromPtr(segment);
-        const shift: u6 = @intCast(segment.page_shift);
-        const slice_idx = diff >> shift;
-        const page_idx = slice_idx -| segment.header_slices;
+
+        // Use comptime constant shifts based on page_kind (avoids memory load)
+        const idx = switch (segment.page_kind) {
+            .small => diff >> types.SMALL_PAGE_SHIFT,
+            .medium => diff >> types.MEDIUM_PAGE_SHIFT,
+            .large, .huge => 0, // Should not reach here due to capacity check above
+        };
+
+        const page_idx = idx -| segment.header_slices;
         return &segment.pages[page_idx];
     }
 
@@ -162,34 +265,33 @@ pub const Segment = struct {
 
     pub inline fn pagePurge(self: *Self, pg: *Page) void {
         if (!self.allow_purge) return;
-        if (!pg.flags.is_commited) return;
+        if (!pg.is_commited()) return;
 
         var psize: usize = undefined;
         const start = self.rawPageStart(pg, &psize);
 
-        // Use madvise to purge
         const ptr: [*]align(std.heap.page_size_min) u8 = @alignCast(start);
-        std.posix.madvise(ptr, psize, std.posix.MADV.FREE) catch {};
-        pg.flags.is_commited = false;
+        std.posix.madvise(ptr, psize, std.posix.MADV.DONTNEED) catch {};
+        pg.set_commited(false);
     }
 
     pub inline fn pageEnsureCommitted(self: *Self, pg: *Page) bool {
-        if (pg.flags.is_commited) return true;
+        if (pg.is_commited()) return true;
         if (!self.allow_decommit) return true;
 
         // Memory is already mapped, just mark as committed
-        pg.flags.is_commited = true;
+        pg.set_commited(true);
         pg.used = 0;
         pg.free = .init();
         pg.local_free = .init();
-        pg.flags.is_zero_init = false;
+        pg.set_zero_init(false);
         return true;
     }
 
     pub inline fn pageClear(self: *Self, pg: *Page) void {
-        const page_idx = pg.segment_idx;
-        pg.segment_in_use = false;
-        pg.flags.page_flags = .{};
+        const page_idx = pg.segment_idx();
+        // Clear all flags, keep segment_idx
+        pg.flags_and_idx = @bitCast(Page.PackedInfo{ .segment_idx = page_idx });
         pg.xthread_free.store(null, .release);
         pg.free = .init();
         pg.local_free = .init();
@@ -214,7 +316,7 @@ pub const Segment = struct {
     pub fn pageClaim(self: *Self, pg: *Page) bool {
         if (!self.pageEnsureCommitted(pg)) return false;
 
-        pg.segment_in_use = true;
+        pg.set_segment_in_use(true);
         self.used += 1;
         return true;
     }
@@ -233,7 +335,7 @@ pub const Segment = struct {
         }) {
             const pg = &self.pages[i];
             @prefetch(pg, .{ .cache = .data, .locality = 3, .rw = .read });
-            if (!pg.segment_in_use) {
+            if (!pg.is_segment_in_use()) {
                 const next_i = if (i + 1 >= self.capacity) 0 else i + 1;
                 @prefetch(&self.pages[next_i], .{ .cache = .data, .locality = 3 });
                 if (self.pageClaim(pg)) {
@@ -308,48 +410,21 @@ pub const Segment = struct {
     }
 
     // =========================================================================
-    // Purge Scheduling
+    // Purge Operations (simplified - no delayed scheduling)
     // =========================================================================
 
-    /// Schedule page for delayed purging
-    pub inline fn schedulePurge(self: *Self, pg: *Page, expire: i64) void {
-        if (!self.allow_purge) return;
-        pg.expire = expire;
-        pg.flags.page_flags.in_purge_queue = true;
-    }
-
-    /// Remove page from purge schedule
-    pub inline fn removePurge(self: *Self, pg: *Page) void {
-        _ = self;
-        pg.expire = 0;
-        pg.flags.page_flags.in_purge_queue = false;
-    }
-
-    /// Check if page purge has expired
-    pub inline fn isPurgeExpired(self: *const Self, pg: *const Page, now: i64) bool {
-        _ = self;
-        return pg.flags.page_flags.in_purge_queue and pg.expire <= now;
-    }
-
-    /// Try to purge expired pages
-    pub inline fn tryPurgeExpired(self: *Self, now: i64) usize {
+    /// Purge all unused pages in segment
+    pub inline fn purgeUnusedPages(self: *Self) usize {
+        if (!self.allow_purge) return 0;
         var purged: usize = 0;
         for (0..self.capacity) |i| {
             const pg = &self.pages[i];
-            if (!pg.segment_in_use and self.isPurgeExpired(pg, now)) {
+            if (!pg.is_segment_in_use() and pg.is_commited()) {
                 self.pagePurge(pg);
-                self.removePurge(pg);
                 purged += 1;
             }
         }
         return purged;
-    }
-
-    /// Remove all pages from purge schedule
-    pub inline fn removeAllPurges(self: *Self) void {
-        for (0..self.capacity) |i| {
-            self.removePurge(&self.pages[i]);
-        }
     }
 
     // =========================================================================
@@ -390,7 +465,7 @@ pub const Segment = struct {
     ) bool {
         for (0..self.capacity) |i| {
             const pg = &self.pages[i];
-            if (pg.segment_in_use) {
+            if (pg.is_segment_in_use()) {
                 if (!visitor(pg, ctx)) {
                     return false;
                 }
@@ -409,7 +484,7 @@ pub const Segment = struct {
         var used_count: usize = 0;
         for (0..self.capacity) |i| {
             const pg = &self.pages[i];
-            if (pg.segment_in_use) {
+            if (pg.is_segment_in_use()) {
                 used_count += 1;
             }
         }
@@ -449,6 +524,9 @@ pub const SegmentsTLD = struct {
 
     // Fast thread ID (TLD address) - set during init, avoids syscall
     thread_id: usize = 0,
+
+    // Counter for empty segment tracking (avoids O(n) counting)
+    empty_segment_count: usize = 0,
 
     // =========================================================================
     // Initialization
@@ -518,8 +596,23 @@ pub const SegmentsTLD = struct {
         const capacity = Segment.capacityForKind(page_kind, page_shift);
         const sizes = Segment.calculateSizes(capacity, required);
 
-        // Try to allocate from arenas first
         var mem_id: MemID = .{};
+
+        // For huge segments, use direct OS allocation to avoid arena complexity
+        // Arena blocks are 32MB which may not handle huge segments well
+        if (page_kind == .huge) {
+            const alignment = std.mem.Alignment.fromByteUnits(types.SEGMENT_ALIGN);
+            const os_ptr = self.os_alloc.rawAlloc(sizes.segment_size, alignment, @returnAddress()) orelse return null;
+            mem_id = MemID.create_os(
+                os_ptr[0..sizes.segment_size],
+                true, // committed
+                true, // zero
+                false, // large
+            );
+            return self.initSegment(os_ptr, mem_id, sizes.segment_size, sizes.info_size, page_kind, page_shift, capacity);
+        }
+
+        // Try to allocate from arenas first for non-huge segments
         const raw_ptr = self.allocFromArena(sizes.segment_size, &mem_id) orelse {
             // Fallback to direct OS allocation if arena allocation fails
             const alignment = std.mem.Alignment.fromByteUnits(types.SEGMENT_ALIGN);
@@ -603,15 +696,31 @@ pub const SegmentsTLD = struct {
 
         segment.thread_id.store(self.thread_id, .release);
 
-        // Initialize pages
+        // Initialize pages - explicitly reset all fields to avoid garbage values
         for (0..capacity) |i| {
-            segment.pages[i] = .{
-                .segment_idx = @intCast(i),
-                .flags = .{
-                    .is_commited = mem_id.flags.initially_committed,
-                    .is_zero_init = mem_id.flags.initially_zero,
-                },
+            var pg = &segment.pages[i];
+            pg.* = .{
+                .free = .init(),
+                .page_start = null,
+                .block_size = 0,
+                .capacity = 0,
+                .reserved = 0,
+                .used = 0,
+                .flags_and_idx = 0,
+                .local_free = .init(),
+                .xthread_free = .init(null),
+                .next = null,
+                .prev = null,
             };
+            // Set segment_idx and initial flags
+            pg.set_segment_idx(@intCast(i));
+            pg.set_commited(mem_id.flags.initially_committed);
+            pg.set_zero_init(mem_id.flags.initially_zero);
+        }
+
+        // Register huge segments (> 32MB) in the global registry
+        if (page_kind == .huge and segment_size > types.SEGMENT_SIZE) {
+            huge_registry.register(segment);
         }
 
         self.trackSize(@intCast(segment_size));
@@ -619,13 +728,23 @@ pub const SegmentsTLD = struct {
     }
 
     pub inline fn freeSegment(self: *Self, segment: *Segment, force: bool) void {
+        // Unregister from huge registry if applicable
+        if (segment.page_kind == .huge and segment.segment_size > types.SEGMENT_SIZE) {
+            huge_registry.unregister(segment);
+        }
+
+        // Update empty segment counter
+        if (segment.used == 0) {
+            self.empty_segment_count -|= 1;
+        }
+
         self.removeFromFreeQueue(segment);
 
         // Purge all uncommitted pages
         if (force and !segment.memid.flags.is_pinned) {
             for (0..segment.capacity) |i| {
                 const pg = &segment.pages[i];
-                if (!pg.segment_in_use and pg.flags.is_commited) {
+                if (!pg.is_segment_in_use() and pg.is_commited()) {
                     segment.pagePurge(pg);
                 }
             }
@@ -659,8 +778,19 @@ pub const SegmentsTLD = struct {
     // Page Allocation
     // =========================================================================
 
+    /// Threshold for segment count before we start aggressively freeing empty segments.
+    /// Each segment is 32MB, so 8 segments = 256MB of cached memory.
+    const SEGMENT_CACHE_THRESHOLD: usize = 8;
+
+    /// How many empty segments to keep cached per queue type.
+    const EMPTY_SEGMENT_CACHE_MAX: usize = 2;
+
+    /// Purge delay in milliseconds (mimalloc style)
+    const PURGE_DELAY_MS: i64 = 10;
+
     pub inline fn freePage(self: *Self, pg: *Page, force: bool) void {
         const segment = Segment.fromPtr(pg);
+        const was_used = segment.used;
         segment.pageClear(pg);
         segment.used -= 1;
 
@@ -668,12 +798,15 @@ pub const SegmentsTLD = struct {
             if (force) {
                 // Only free segment if explicitly forced
                 self.freeSegment(segment, true);
+            } else if (self.empty_segment_count >= EMPTY_SEGMENT_CACHE_MAX * 3 and self.count > SEGMENT_CACHE_THRESHOLD) {
+                // Too many empty segments cached, free this one immediately
+                self.freeSegment(segment, true);
             } else {
-                // Keep empty segment in free queue for reuse
-                // Use in_free_queue flag (O(1)) instead of hasItem (O(n))
+                // Cache empty segment for reuse
+                self.empty_segment_count += 1;
                 self.insertInFreeQueue(segment);
             }
-        } else if (segment.used + 1 == segment.capacity) {
+        } else if (was_used == segment.capacity) {
             // Segment was full, now has free space - add to queue
             self.insertInFreeQueue(segment);
         }
@@ -693,6 +826,7 @@ pub const SegmentsTLD = struct {
             @prefetch(seg, .{ .cache = .data, .locality = 3, .rw = .read });
             if (seg.hasFree()) {
                 if (seg.findFreePage()) |pg| {
+                    @setEvalBranchQuota(100_000);
                     if (!seg.hasFree()) {
                         self.removeFromFreeQueue(seg);
                     }
@@ -725,8 +859,9 @@ pub const SegmentsTLD = struct {
             pg.xthread_free.store(null, .release);
             pg.next = null;
             pg.prev = null;
-            pg.flags.page_flags = .{}; // Reset all page flags
-            pg.retire_expire = 0;
+            // Reset flags but keep segment_idx and segment_in_use
+            pg.set_in_full(false);
+            pg.set_in_bin(false);
 
             return pg;
         }
@@ -763,7 +898,7 @@ pub const SegmentsTLD = struct {
             seg.in_free_queue = false;
             const pg = &seg.pages[0];
             // Reinitialize the page
-            pg.segment_in_use = true;
+            pg.set_segment_in_use(true);
             pg.block_size = block_size;
             pg.page_start = null; // Will be set on first alloc
             pg.capacity = 0;
@@ -774,8 +909,8 @@ pub const SegmentsTLD = struct {
             pg.xthread_free.store(null, .release);
             pg.next = null;
             pg.prev = null;
-            pg.flags.page_flags = .{};
-            pg.retire_expire = 0;
+            pg.set_in_full(false);
+            pg.set_in_bin(false);
             seg.used = 1;
             return pg;
         }
@@ -803,7 +938,7 @@ pub const SegmentsTLD = struct {
         }
 
         pg.block_size = size;
-        pg.flags.is_huge = true;
+        pg.set_huge(true);
         return pg;
     }
 
@@ -884,29 +1019,48 @@ pub const SegmentsTLD = struct {
         return self.allocPage(block_size);
     }
 
-    /// Collect and purge pages across all segments
+    /// Collect and purge pages across all segments.
+    /// When force=true, also frees empty segments back to the OS.
     pub fn collect(self: *Self, force: bool) usize {
         var collected: usize = 0;
         const now = std.time.milliTimestamp();
+
+        // Collect segments to free (can't modify queue while iterating)
+        var segments_to_free: [64]*Segment = undefined;
+        var free_count: usize = 0;
 
         // Iterate through free queues and purge expired pages
         inline for ([_]*SegmentQueue{ &self.small_free, &self.medium_free, &self.large_free }) |q| {
             var segment = q.tail;
             while (segment) |seg| {
+                const next = seg.prev;
                 if (force) {
-                    seg.removeAllPurges();
-                    for (0..seg.capacity) |i| {
-                        const pg = &seg.pages[i];
-                        if (!pg.segment_in_use and pg.flags.is_commited) {
-                            seg.pagePurge(pg);
-                            collected += 1;
+                    // If segment is completely empty, mark it for freeing
+                    if (seg.used == 0 and free_count < segments_to_free.len) {
+                        segments_to_free[free_count] = seg;
+                        free_count += 1;
+                    } else {
+                        // Purge unused pages in non-empty segments
+                        for (0..seg.capacity) |i| {
+                            const pg = &seg.pages[i];
+                            if (!pg.is_segment_in_use() and pg.is_commited()) {
+                                seg.pagePurge(pg);
+                                collected += 1;
+                            }
                         }
                     }
                 } else {
-                    collected += seg.tryPurgeExpired(now);
+                    // Time-based purge check removed - simplified purge
+                    _ = now;
                 }
-                segment = seg.prev;
+                segment = next;
             }
+        }
+
+        // Free empty segments (outside of iteration to avoid queue corruption)
+        for (segments_to_free[0..free_count]) |seg| {
+            self.freeSegment(seg, true);
+            collected += 1;
         }
 
         return collected;
@@ -929,45 +1083,20 @@ pub const SegmentsTLD = struct {
     pub inline fn reduceMemory(self: *Self, target_count: usize) usize {
         var freed: usize = 0;
 
-        // Free empty segments from small queue
-        while (!self.isWithinTarget(target_count)) {
-            const seg = self.small_free.pop() orelse break;
-            seg.in_free_queue = false;
-            if (seg.used == 0) {
-                self.freeSegment(seg, true);
-                freed += 1;
-            } else {
-                seg.in_free_queue = true;
-                self.small_free.push(seg);
-                break;
-            }
-        }
-
-        // Free empty segments from medium queue
-        while (!self.isWithinTarget(target_count)) {
-            const seg = self.medium_free.pop() orelse break;
-            seg.in_free_queue = false;
-            if (seg.used == 0) {
-                self.freeSegment(seg, true);
-                freed += 1;
-            } else {
-                seg.in_free_queue = true;
-                self.medium_free.push(seg);
-                break;
-            }
-        }
-
-        // Free empty segments from large queue
-        while (!self.isWithinTarget(target_count)) {
-            const seg = self.large_free.pop() orelse break;
-            seg.in_free_queue = false;
-            if (seg.used == 0) {
-                self.freeSegment(seg, true);
-                freed += 1;
-            } else {
-                seg.in_free_queue = true;
-                self.large_free.push(seg);
-                break;
+        // Free empty segments from all queues
+        inline for ([_]*SegmentQueue{ &self.small_free, &self.medium_free, &self.large_free }) |q| {
+            while (!self.isWithinTarget(target_count)) {
+                const seg = q.pop() orelse break;
+                seg.in_free_queue = false;
+                if (seg.used == 0) {
+                    // Note: freeSegment already decrements empty_segment_count
+                    self.freeSegment(seg, true);
+                    freed += 1;
+                } else {
+                    seg.in_free_queue = true;
+                    q.push(seg);
+                    break;
+                }
             }
         }
 
@@ -976,7 +1105,7 @@ pub const SegmentsTLD = struct {
 
     /// Free a huge page
     pub inline fn freeHugePage(self: *Self, pg: *Page) void {
-        assert(pg.flags.is_huge);
+        assert(pg.is_huge());
         const segment = Segment.fromPtr(pg);
         self.freeSegment(segment, true);
     }
@@ -984,7 +1113,7 @@ pub const SegmentsTLD = struct {
     /// Reset huge page memory (decommit/recommit for zeroing)
     pub inline fn resetHugePage(self: *Self, pg: *Page) void {
         _ = self;
-        assert(pg.flags.is_huge);
+        assert(pg.is_huge());
         const segment = Segment.fromPtr(pg);
 
         var psize: usize = undefined;
@@ -993,7 +1122,7 @@ pub const SegmentsTLD = struct {
         // Use madvise to reset memory
         const ptr: [*]align(std.heap.page_size_min) u8 = @alignCast(start);
         std.posix.madvise(ptr, psize, std.posix.MADV.FREE) catch {};
-        pg.flags.is_zero_init = true;
+        pg.set_zero_init(true);
     }
 
     // pub fn getStats(self: *const Self) struct {
@@ -1143,16 +1272,16 @@ test "Segment: pageClaim and used counter" {
 
     // Initialize pages
     for (0..4) |i| {
-        segment.pages[i] = .{
-            .segment_idx = @intCast(i),
-            .flags = .{ .is_commited = true },
-        };
+        var pg = &segment.pages[i];
+        pg.* = .{};
+        pg.set_segment_idx(@intCast(i));
+        pg.set_commited(true);
     }
 
     // Claim first page
     try testing.expect(segment.pageClaim(&segment.pages[0]));
     try testing.expectEqual(@as(usize, 1), segment.used);
-    try testing.expect(segment.pages[0].segment_in_use);
+    try testing.expect(segment.pages[0].is_segment_in_use());
 
     // Claim second page
     try testing.expect(segment.pageClaim(&segment.pages[1]));
@@ -1180,28 +1309,28 @@ test "Segment: findFreePage" {
 
     // Initialize pages
     for (0..3) |i| {
-        segment.pages[i] = .{
-            .segment_idx = @intCast(i),
-            .flags = .{ .is_commited = true },
-        };
+        var pg = &segment.pages[i];
+        pg.* = .{};
+        pg.set_segment_idx(@intCast(i));
+        pg.set_commited(true);
     }
 
     // Find first free page
     const pg1 = segment.findFreePage();
     try testing.expect(pg1 != null);
-    try testing.expectEqual(@as(u32, 0), pg1.?.segment_idx);
+    try testing.expectEqual(@as(u10, 0), pg1.?.segment_idx());
     try testing.expectEqual(@as(usize, 1), segment.used);
 
     // Find second free page
     const pg2 = segment.findFreePage();
     try testing.expect(pg2 != null);
-    try testing.expectEqual(@as(u32, 1), pg2.?.segment_idx);
+    try testing.expectEqual(@as(u10, 1), pg2.?.segment_idx());
     try testing.expectEqual(@as(usize, 2), segment.used);
 
     // Find third free page
     const pg3 = segment.findFreePage();
     try testing.expect(pg3 != null);
-    try testing.expectEqual(@as(u32, 2), pg3.?.segment_idx);
+    try testing.expectEqual(@as(u10, 2), pg3.?.segment_idx());
     try testing.expectEqual(@as(usize, 3), segment.used);
 
     // No more free pages
@@ -1216,21 +1345,18 @@ test "Segment: pageClear" {
     segment.allow_purge = false; // Don't actually purge in test
 
     var page: Page = .{
-        .segment_idx = 0,
-        .segment_in_use = true,
         .used = 10,
-        .flags = .{
-            .is_commited = true,
-            .page_flags = .{ .in_full = true, .has_aligned = true },
-        },
     };
+    page.set_segment_idx(0);
+    page.set_segment_in_use(true);
+    page.set_commited(true);
+    page.set_in_full(true);
 
     segment.pageClear(&page);
 
-    try testing.expect(!page.segment_in_use);
+    try testing.expect(!page.is_segment_in_use());
     try testing.expectEqual(@as(u16, 0), page.used);
-    try testing.expect(!page.flags.page_flags.in_full);
-    try testing.expect(!page.flags.page_flags.has_aligned);
+    try testing.expect(!page.is_in_full());
 }
 
 test "SegmentsTLD: trackSize" {
@@ -1460,29 +1586,29 @@ test "Segment: canReclaim" {
     try testing.expect(!segment.canReclaim());
 }
 
-test "Segment: purge scheduling" {
+test "Segment: page flags" {
     const testing = std.testing;
-
-    var segment: Segment = .{};
-    segment.allow_purge = true;
 
     var page: Page = .{};
 
-    // Schedule purge
-    const expire_time: i64 = 1000;
-    segment.schedulePurge(&page, expire_time);
+    // Test flag accessors
+    try testing.expect(!page.is_in_full());
+    page.set_in_full(true);
+    try testing.expect(page.is_in_full());
+    page.set_in_full(false);
+    try testing.expect(!page.is_in_full());
 
-    try testing.expect(page.flags.page_flags.in_purge_queue);
-    try testing.expectEqual(expire_time, page.expire);
+    // Test segment_idx
+    try testing.expectEqual(@as(u10, 0), page.segment_idx());
+    page.set_segment_idx(42);
+    try testing.expectEqual(@as(u10, 42), page.segment_idx());
 
-    // Check expired
-    try testing.expect(segment.isPurgeExpired(&page, 1001));
-    try testing.expect(!segment.isPurgeExpired(&page, 999));
-
-    // Remove from purge
-    segment.removePurge(&page);
-    try testing.expect(!page.flags.page_flags.in_purge_queue);
-    try testing.expectEqual(@as(i64, 0), page.expire);
+    // Test flags don't interfere with segment_idx
+    page.set_in_full(true);
+    page.set_in_bin(true);
+    try testing.expectEqual(@as(u10, 42), page.segment_idx());
+    try testing.expect(page.is_in_full());
+    try testing.expect(page.is_in_bin());
 }
 
 test "Segment: isValid" {
@@ -1499,17 +1625,17 @@ test "Segment: isValid" {
 
     // Initialize pages
     for (0..3) |i| {
-        segment.pages[i] = .{
-            .segment_idx = @intCast(i),
-            .segment_in_use = false,
-        };
+        var pg = &segment.pages[i];
+        pg.* = .{};
+        pg.set_segment_idx(@intCast(i));
+        pg.set_segment_in_use(false);
     }
 
     // Valid: used count matches
     try testing.expect(segment.isValid());
 
     // Mark one page in use
-    segment.pages[0].segment_in_use = true;
+    segment.pages[0].set_segment_in_use(true);
     segment.used = 1;
     try testing.expect(segment.isValid());
 

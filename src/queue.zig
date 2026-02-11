@@ -230,6 +230,7 @@ pub fn DoublyLinkedListType(
                 assert(@field(tail_old, field_next) == null);
 
                 if (@field(tail_old, field_back)) |prev| {
+                    @branchHint(.likely);
                     @prefetch(prev, .{ .cache = .data, .locality = 3, .rw = .read });
                 }
 
@@ -609,6 +610,7 @@ const IntrusiveLifoAny = struct {
         const link = self.head orelse return null;
         self.head = link.next;
         if (link.next) |next_link| {
+            @branchHint(.likely);
             @prefetch(next_link, .{ .cache = .data, .locality = 3, .rw = .read });
         }
         return link;

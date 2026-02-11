@@ -125,7 +125,7 @@ pub fn build(b: *std.Build) void {
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/main.zig"),
             .target = target,
-            .optimize = optimize,
+            .optimize = .ReleaseFast,
             .imports = &.{
                 .{ .name = "mimalloc_zig", .module = mimalloc_zig },
                 .{ .name = "config", .module = conf },

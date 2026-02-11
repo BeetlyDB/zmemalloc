@@ -20,7 +20,9 @@ const SegmentAbandonedQueue = segment_mod.SegmentAbandonedQueue;
 
 const MAX_SCAN_PAGES = 8;
 const COLLECT_INTERVAL: usize = 512;
-const ABANDON_RECLAIM_LIMIT: usize = 8; // Max segments to reclaim per allocation
+const ABANDON_RECLAIM_LIMIT: usize = 16; // Max segments to reclaim per allocation
+const SEGMENT_HIGH_WATERMARK: usize = 128; // Trigger reduction when segment count exceeds this
+const PURGE_DELAY_MS: i64 = 100; // Delay before purging freed pages
 
 // =============================================================================
 // Global State (Process-wide)
@@ -38,9 +40,10 @@ var active_thread_count: Atomic(usize) = .init(0);
 
 threadlocal var tld: TLD = .{};
 threadlocal var tld_initialized: bool = false;
-threadlocal var alloc_counter: usize = 0;
 // Direct heap pointer — also serves as init sentinel (null = not initialized)
 threadlocal var cached_heap: ?*Heap = null;
+/// Last purge check timestamp (for time-based purge delay)
+threadlocal var last_purge_check: i64 = 0;
 
 inline fn ensureTldInitialized() *TLD {
     if (cached_heap == null) {
@@ -142,27 +145,22 @@ inline fn setDirectPointerForBlockSize(heap: *Heap, page: *Page) void {
     }
 }
 
-/// Lightweight collection - only processes retire counters (called periodically)
-/// This is much faster than full collect() as it only decrements counters
-inline fn collectRetired(heap: *Heap) void {
-    // Only scan a subset of bins per call to keep it fast
-    const start_bin = alloc_counter % (types.BIN_HUGE + 1);
-    const end_bin = @min(start_bin + 16, types.BIN_HUGE + 1);
+/// Try purge expired pages if enough time has passed (time-based purge delay)
+/// Called during allocation when memory pressure is high
+inline fn tryPurgeDelayed() void {
+    if (!tld_initialized) return;
 
-    for (start_bin..end_bin) |bin| {
-        const pq = &heap.pages[bin];
-        if (pq.tail) |pg| {
-            // Only check the tail page (most likely to be empty)
-            if (pg.used == 0 and pg.capacity > 0 and pg.retire_expire > 0) {
-                pg.retire_expire -|= 1;
-                if (pg.retire_expire == 0) {
-                    // Time to retire this page
-                    pg.pageRemoveFromBin(heap, bin);
-                    clearDirectPointersForPage(heap, pg);
-                    tld.segments.freePage(pg, false);
-                }
-            }
-        }
+    const now = std.time.milliTimestamp();
+    // Only check every PURGE_DELAY_MS to avoid frequent syscalls
+    if (now - last_purge_check < PURGE_DELAY_MS) return;
+    last_purge_check = now;
+
+    // Purge expired pages in segments
+    _ = tld.segments.collect(false);
+
+    // If still over high watermark, reduce more aggressively
+    if (tld.segments.count > SEGMENT_HIGH_WATERMARK) {
+        _ = tld.segments.reduceMemory(SEGMENT_HIGH_WATERMARK / 2);
     }
 }
 
@@ -172,29 +170,45 @@ inline fn mallocGeneric(heap: *Heap, size: usize, zero: bool) ?[*]u8 {
 
     // Round up to bin's block size - this allows page reuse across similar sizes
     const bin = page_mod.binFromSize(size);
-    const block_size = page_mod.blockSizeForBin(bin);
+    // For huge allocations (> LARGE_OBJ_SIZE_MAX), use the requested size directly
+    // since binFromSize caps at BIN_HUGE which corresponds to a smaller size
+    const block_size = if (size > types.LARGE_OBJ_SIZE_MAX)
+        size
+    else
+        page_mod.blockSizeForBin(bin);
 
     // Check bin queue first for all sizes (including large)
     // This allows page reuse for sizes > MEDIUM_OBJ_SIZE_MAX
     if (bin < heap.pages.len) {
         const pq = &heap.pages[bin];
         if (pq.tail) |pg| {
-            if (pg.popFreeBlock()) |block| {
-                @branchHint(.likely);
-                if (!pg.hasFree()) {
-                    @branchHint(.unlikely);
-                    pg.pageRemoveFromBin(heap, bin);
-                    pg.set_in_full(true);
-                    clearDirectPointersForPage(heap, pg);
+            // For huge allocations, we must verify the page's block_size matches
+            // since all huge sizes map to BIN_HUGE regardless of actual size
+            if (pg.block_size >= block_size) {
+                if (pg.popFreeBlock()) |block| {
+                    @branchHint(.likely);
+                    if (!pg.hasFree()) {
+                        @branchHint(.unlikely);
+                        pg.pageRemoveFromBin(heap, bin);
+                        pg.set_in_full(true);
+                        clearDirectPointersForPage(heap, pg);
+                    }
+                    const ptr: [*]u8 = @ptrCast(block);
+                    if (zero) {
+                        @branchHint(.cold);
+                        @memset(ptr[0..block_size], 0);
+                    }
+                    return ptr;
                 }
-                const ptr: [*]u8 = @ptrCast(block);
-                if (zero) {
-                    @branchHint(.cold);
-                    @memset(ptr[0..block_size], 0);
-                }
-                return ptr;
             }
         }
+    }
+
+    // Before allocating new pages, try purging expired ones (time-based)
+    // This is the "idle" point where we can afford cleanup
+    if (t.segments.count > SEGMENT_HIGH_WATERMARK / 2) {
+        @branchHint(.cold);
+        tryPurgeDelayed();
     }
 
     // Try to get a page, reclaim abandoned segments if needed
@@ -202,7 +216,6 @@ inline fn mallocGeneric(heap: *Heap, size: usize, zero: bool) ?[*]u8 {
     if (page == null) {
         // Try to reclaim abandoned segments from other threads
         if (global_subproc.abandoned_count.load(.monotonic) > 0) {
-            @branchHint(.cold);
             _ = reclaimAbandoned(ABANDON_RECLAIM_LIMIT);
             page = t.segments.allocPage(block_size);
         }
@@ -246,7 +259,7 @@ inline fn mallocGeneric(heap: *Heap, size: usize, zero: bool) ?[*]u8 {
 
     // Add page to heap queue if not already there
     // Use in_bin flag to track queue membership
-    if (bin < heap.pages.len and !pg.flags.page_flags.in_bin) {
+    if (bin < heap.pages.len and !pg.is_in_bin()) {
         @branchHint(.likely);
         pg.set_in_full(false);
         pg.pagePushBin(heap, bin);
@@ -268,22 +281,6 @@ inline fn clearDirectPointersForPage(heap: *Heap, page: *Page) void {
             heap.pages_free_direct[block_wsize] = null;
         }
     }
-}
-
-inline fn retirePage(page: *Page) void {
-    const heap = &heap_mod.heap_main;
-    const bin = page_mod.binFromSize(page.block_size);
-
-    // remove from page queue
-    if (bin < heap.pages.len) {
-        page.pageRemoveFromBin(heap, bin);
-    }
-
-    // clear direct lookup for all wsizes in this bin
-    clearDirectPointersForPage(heap, page);
-
-    // free page to segment
-    tld.segments.freePage(page, false);
 }
 
 /// Get fast thread ID - uses TLD address (unique per thread, no syscall)
@@ -317,7 +314,6 @@ inline fn freeImpl(ptr: ?*anyopaque) void {
     if (page_thread == fastThreadId()) {
         @branchHint(.likely);
         // Hot path: just push to free list
-        @prefetch(block, .{ .cache = .data, .locality = 3, .rw = .read });
         page.pushFreeBlock(block);
         // Cold path: handle full page transition
         if (page.is_in_full()) {
@@ -325,7 +321,6 @@ inline fn freeImpl(ptr: ?*anyopaque) void {
             freeColdPath(page);
         }
     } else if (page_thread == 0) {
-        @prefetch(block, .{ .cache = .data, .locality = 3, .rw = .read });
         // Abandoned page - push to free list
         page.pushFreeBlock(block);
     } else {
@@ -436,10 +431,13 @@ pub fn malloc(size: usize) ?[*]u8 {
 
     // Fast path for small allocations
     if (size <= MAX_FAST_SIZE) {
+        @branchHint(.likely);
         if (mallocSmallFast(heap, size)) |ptr| {
+            @branchHint(.likely);
             return ptr;
         }
         if (mallocMedium(heap, size)) |ptr| {
+            @branchHint(.likely);
             return ptr;
         }
         return mallocGeneric(heap, size, false);
@@ -447,6 +445,7 @@ pub fn malloc(size: usize) ?[*]u8 {
 
     // Medium/large path
     if (size <= types.MEDIUM_OBJ_SIZE_MAX) {
+        @branchHint(.likely);
         if (mallocMedium(heap, size)) |ptr| {
             return ptr;
         }
@@ -542,30 +541,18 @@ pub fn collect(force: bool) usize {
     // Collect unused memory from segments
     collected += tld.segments.collect(force);
 
-    // Clean up heap's page queues - decrement retire_expire and retire when 0
+    // Clean up heap's page queues - retire empty pages
     const heap = &heap_mod.heap_main;
     for (&heap.pages, 0..) |*pq, bin| {
         var page = pq.tail;
         while (page) |pg| {
             const next = pg.prev;
+            // Retire empty pages (no delay - simplifies logic)
             if (pg.used == 0 and pg.capacity > 0) {
-                if (force) {
-                    // Force retire
-                    pg.pageRemoveFromBin(heap, bin);
-                    clearDirectPointersForPage(heap, pg);
-                    tld.segments.freePage(pg, true);
-                    collected += 1;
-                } else if (pg.retire_expire > 0) {
-                    // Decrement expire counter
-                    pg.retire_expire -= 1;
-                    if (pg.retire_expire == 0) {
-                        // Time to retire
-                        pg.pageRemoveFromBin(heap, bin);
-                        clearDirectPointersForPage(heap, pg);
-                        tld.segments.freePage(pg, false);
-                        collected += 1;
-                    }
-                }
+                pg.pageRemoveFromBin(heap, bin);
+                clearDirectPointersForPage(heap, pg);
+                tld.segments.freePage(pg, force);
+                collected += 1;
             }
             page = next;
         }
@@ -582,22 +569,11 @@ pub fn collect(force: bool) usize {
     for (pages_to_check) |maybe_pg| {
         const pg = maybe_pg orelse continue;
         if (pg.used == 0 and pg.capacity > 0) {
-            if (force) {
-                clearDirectPointersForPage(heap, pg);
-                const bin = page_mod.binFromSize(pg.block_size);
-                pg.pageRemoveFromBin(heap, bin);
-                tld.segments.freePage(pg, true);
-                collected += 1;
-            } else if (pg.retire_expire > 0) {
-                pg.retire_expire -= 1;
-                if (pg.retire_expire == 0) {
-                    clearDirectPointersForPage(heap, pg);
-                    const bin = page_mod.binFromSize(pg.block_size);
-                    pg.pageRemoveFromBin(heap, bin);
-                    tld.segments.freePage(pg, false);
-                    collected += 1;
-                }
-            }
+            clearDirectPointersForPage(heap, pg);
+            const bin = page_mod.binFromSize(pg.block_size);
+            pg.pageRemoveFromBin(heap, bin);
+            tld.segments.freePage(pg, force);
+            collected += 1;
         }
     }
 
@@ -621,7 +597,7 @@ pub fn threadExit() void {
     for (&heap.pages) |*pq| {
         while (pq.tail) |pg| {
             const prev = pg.prev;
-            pg.flags.page_flags.in_bin = false;
+            pg.set_in_bin(false);
             pg.next = null;
             pg.prev = null;
             pq.tail = prev;
@@ -2681,4 +2657,179 @@ test "correctness: stress all size classes sequentially" {
 
         size = if (size < 16) size + 1 else size + size / 4;
     }
+}
+
+// =============================================================================
+// Huge Allocation Tests
+// =============================================================================
+
+test "segment and page sizes" {
+    // Verify sizes are what we expect
+    const segment_size = @sizeOf(Segment);
+    const page_size_bytes = @sizeOf(page_mod.Page);
+
+    // Page should be ~100-150 bytes
+    try std.testing.expect(page_size_bytes < 200);
+
+    // Segment with 512 pages should be < 150KB
+    try std.testing.expect(segment_size < 150 * 1024);
+}
+
+test "huge allocation: direct mmap sanity" {
+    // Test that OS allocation works correctly for huge sizes
+    const size: usize = 20 * types.MiB;
+    const aligned_size = std.mem.alignForward(usize, size, std.heap.page_size_min);
+
+    const slice = std.posix.mmap(
+        null,
+        aligned_size,
+        std.posix.PROT.READ | std.posix.PROT.WRITE,
+        .{ .TYPE = .PRIVATE, .ANONYMOUS = true },
+        -1,
+        0,
+    ) catch return;
+    defer std.posix.munmap(slice);
+
+    const ptr = slice.ptr;
+
+    // Write at various offsets - if mmap works, this should work
+    ptr[0] = 0xAA;
+    ptr[size / 2] = 0xBB;
+    ptr[size - 1] = 0xCC;
+
+    try std.testing.expectEqual(@as(u8, 0xAA), ptr[0]);
+    try std.testing.expectEqual(@as(u8, 0xBB), ptr[size / 2]);
+    try std.testing.expectEqual(@as(u8, 0xCC), ptr[size - 1]);
+}
+
+test "huge allocation: basic alloc and free" {
+    // Test with a simpler huge size first
+    const size: usize = 17 * types.MiB;
+
+    const ptr = malloc(size) orelse return;
+    defer free_mem(ptr);
+
+    // Get segment and validate sizes
+    const segment = Segment.fromPtr(ptr);
+
+    // Sanity checks
+    try std.testing.expect(segment.segment_size > 0);
+    try std.testing.expect(segment.segment_size >= size);
+    try std.testing.expect(segment.segment_info_size < 200 * 1024); // info_size should be < 200KB
+
+    // Calculate usable memory
+    const usable_size = segment.segment_size - segment.segment_info_size;
+    try std.testing.expect(usable_size >= size);
+
+    // The ptr should be at segment + segment_info_size
+    const expected_ptr = @intFromPtr(segment) + segment.segment_info_size;
+    try std.testing.expectEqual(expected_ptr, @intFromPtr(ptr));
+
+    // Write at start - should always work
+    ptr[0] = 0xAA;
+    try std.testing.expectEqual(@as(u8, 0xAA), ptr[0]);
+
+    // Write at 1MB - should work
+    if (usable_size > 1 * types.MiB) {
+        ptr[1 * types.MiB] = 0xBB;
+        try std.testing.expectEqual(@as(u8, 0xBB), ptr[1 * types.MiB]);
+    }
+
+    // Write at middle - within usable_size
+    const mid_offset = @min(size / 2, usable_size - 1);
+    ptr[mid_offset] = 0xCC;
+    try std.testing.expectEqual(@as(u8, 0xCC), ptr[mid_offset]);
+}
+
+test "huge allocation: fromPtr across segment boundaries" {
+    // Allocate 64 MiB - this spans 2 x 32MB segments
+    // Tests that fromPtr correctly finds segment for pointers > 32MB into allocation
+    const size = 64 * types.MiB;
+    const ptr = malloc(size) orelse return;
+    defer free_mem(ptr);
+
+    // Write at various offsets, especially past 32MB boundary
+    const offsets = [_]usize{
+        0, // Start
+        16 * types.MiB, // Middle of first 32MB
+        31 * types.MiB, // Near end of first 32MB
+        33 * types.MiB, // Just past 32MB boundary (tests back-pointer)
+        48 * types.MiB, // Well into second 32MB region
+        size - 1, // End
+    };
+
+    // Write patterns at each offset
+    for (offsets, 0..) |offset, i| {
+        if (offset < size) {
+            ptr[offset] = @truncate(0x10 + i);
+        }
+    }
+
+    // Verify patterns
+    for (offsets, 0..) |offset, i| {
+        if (offset < size) {
+            const expected: u8 = @truncate(0x10 + i);
+            try std.testing.expectEqual(expected, ptr[offset]);
+        }
+    }
+
+    // Test that Segment.fromPtr works correctly for pointer past 32MB
+    const ptr_at_40mb = ptr + 40 * types.MiB;
+    const segment = Segment.fromPtr(ptr_at_40mb);
+
+    // Segment should be valid and the same as segment from ptr at start
+    const segment_start = Segment.fromPtr(ptr);
+    try std.testing.expectEqual(segment_start, segment);
+}
+
+test "huge allocation: multiple huge allocs" {
+    var ptrs: [4]?[*]u8 = [_]?[*]u8{null} ** 4;
+    const sizes = [_]usize{ 20 * types.MiB, 40 * types.MiB, 50 * types.MiB, 35 * types.MiB };
+
+    // Allocate multiple huge blocks
+    for (sizes, 0..) |size, i| {
+        ptrs[i] = malloc(size);
+        if (ptrs[i]) |p| {
+            // Write unique pattern
+            @memset(p[0..@min(size, 4096)], @truncate(0x50 + i));
+        }
+    }
+
+    // Verify patterns haven't been corrupted
+    for (sizes, 0..) |size, i| {
+        if (ptrs[i]) |p| {
+            const expected: u8 = @truncate(0x50 + i);
+            for (p[0..@min(size, 4096)]) |byte| {
+                try std.testing.expectEqual(expected, byte);
+            }
+        }
+    }
+
+    // Free all
+    for (ptrs) |p| {
+        free_mem(p);
+    }
+}
+
+test "huge allocation: realloc from small to huge" {
+    // Start with small allocation
+    var ptr = malloc(1024) orelse return;
+    @memset(ptr[0..1024], 0x55);
+
+    // Grow to huge size
+    ptr = realloc(ptr, 20 * types.MiB) orelse {
+        free_mem(ptr);
+        return;
+    };
+
+    // Original data should be preserved
+    for (ptr[0..1024]) |byte| {
+        try std.testing.expectEqual(@as(u8, 0x55), byte);
+    }
+
+    // Write to new space
+    ptr[10 * types.MiB] = 0xAA;
+    try std.testing.expectEqual(@as(u8, 0xAA), ptr[10 * types.MiB]);
+
+    free_mem(ptr);
 }

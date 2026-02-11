@@ -64,12 +64,6 @@ pub inline fn clamp(comptime T: type, sz: T, min: T, max: T) T {
     return @max(min, @min(sz, max));
 }
 
-// Align a byte size to a size in _machine words_
-pub inline fn wsizeCount(size: usize) usize {
-    assert(size <= types.SIZE_MAX - @sizeOf(usize));
-    return (size + @sizeOf(usize) - 1) / @sizeOf(usize);
-}
-
 pub inline fn zeroed(bytes: []const u8) bool {
     var byte_bits: u8 = 0;
     for (bytes) |byte| {

@@ -1,13 +1,26 @@
+//! Page and Block management for zmemalloc.
+//!
+//! A Page is a region within a segment that holds fixed-size blocks.
+//! Pages use three-level free list sharding for optimal performance:
+//! - `free`: main free list for recycled blocks
+//! - `local_free`: same-thread freed blocks (merged into free on demand)
+//! - `xthread_free`: cross-thread freed blocks (atomic, lock-free)
+//!
+//! Allocation uses bump pointer for fresh pages, then recycles from free lists.
+
 const std = @import("std");
 const list = @import("queue.zig");
 const types = @import("types.zig");
 const Atomic = std.atomic.Value;
 const builtin = @import("builtin");
-const bounded_array = @import("bounded_array.zig");
 const assert = @import("util.zig").assert;
 const heap = @import("heap.zig");
 
-/// Free block - overlays on free memory, uses intrusive linked list
+//TODO: add more documentation on each function and use sep
+
+/// Intrusive free block structure.
+/// When memory is free, first 8 bytes contain pointer to next free block.
+/// When allocated, user owns entire block including these bytes.
 //------------------------------------------------------------------------------------
 //
 // Allocated memory (64 bytes):
@@ -58,91 +71,178 @@ pub const Block = struct {
     link: list.IntrusiveLifo(Block).Link = .{},
 };
 
+/// Page structure - exactly 64 bytes to fit in single cache line.
+///
+/// Memory layout optimized for allocation hot path:
+/// - First 32 bytes: hot fields accessed on every alloc (free list, block_size, counters)
+/// - Next 32 bytes: queue management and cross-thread state
+///
+/// Uses bump pointer allocation for fresh pages (sequential memory access),
+/// then recycles from free lists for subsequent allocations.
 pub const Page = struct {
     const Self = @This();
 
-    // === Cache line 0: hot allocation path ===
-    free: list.IntrusiveLifo(Block) = .init(), // free blocks (recycled + freed)
+    // === Hot path fields (32 bytes) ===
+    /// Main free list - recycled blocks ready for reuse
+    free: list.IntrusiveLifo(Block) = .init(),
+    /// Start of allocatable memory area within segment
     page_start: ?[*]u8 = null,
+    /// Size of each block in this page (all blocks same size)
     block_size: usize = 0,
-    capacity: u16 = 0, // max number of blocks
-    reserved: u16 = 0, // bump pointer position
-    used: u16 = 0, // blocks in use
-    block_size_shift: u8 = 0,
-    flags: Flags = .{},
-    // 8 + 8 + 8 + 2 + 2 + 2 + 1 + 1 = 32 bytes — fits first half of cache line
+    /// Maximum number of blocks that fit in this page
+    capacity: u16 = 0,
+    /// Bump pointer position - blocks [0..reserved) have been allocated at least once
+    reserved: u16 = 0,
+    /// Number of blocks currently in use by application
+    used: u16 = 0,
+    /// Packed: segment_idx (10 bits) + flags (6 bits)
+    flags_and_idx: u16 = 0,
 
-    // === Cache line 0/1: less frequent fields ===
-    local_free: list.IntrusiveLifo(Block) = list.IntrusiveLifo(Block).init(), // kept for xthread collection
-    xthread_free: Atomic(?*Block) = .init(null), // cross-thread free list (atomic)
-    next: ?*Page = null, // next page owned by this thread with the same `block_size`
+    // === Queue fields (32 bytes) ===
+    /// Same-thread freed blocks - merged into `free` when `free` is empty
+    local_free: list.IntrusiveLifo(Block) = .init(),
+    /// Cross-thread freed blocks - atomic lock-free list
+    xthread_free: Atomic(?*Block) = .init(null),
+    /// Next page in heap's bin queue
+    next: ?*Page = null,
+    /// Previous page in heap's bin queue
     prev: ?*Page = null,
 
-    // Segment info
-    segment_idx: u32 = 0, // index within segment
-    slice_count: u32 = 0, // number of slices this page uses
-    slice_offset: u32 = 0, // offset from segment start in slices
+    comptime {
+        std.debug.assert(@sizeOf(Page) == 64);
+    }
 
-    retire_expire: u8 = 0,
-    heap_tag: u8 = 0,
-    segment_in_use: bool = false,
-    expire: i64 = 0, // expiration time for delayed purge
-
-    pub const Flags = packed struct(u8) {
-        free_is_zero: bool = false,
-        is_commited: bool = false,
-        is_zero_init: bool = false,
-        is_huge: bool = false,
-        page_flags: PageFlags = .{},
-    };
-
-    pub const Queue = list.DoublyLinkedListType(Page, .next, .prev); //lifo
-
-    pub const PageKind = union(enum) {
-        PAGE_SMALL, // small blocks go into 64KiB pages inside a segment
-        PAGE_MEDIUM, // medium blocks go into 512KiB pages inside a segment
-        PAGE_LARGE, // larger blocks go into a single page spanning a whole segment
-        PAGE_HUGE, // a huge page is a single page in a segment of variable size
-        // used for blocks `> LARGE_OBJ_SIZE_MAX` or an aligment `> BLOCK_ALIGNMENT_MAX`.
-    };
-
-    pub const PageFlags = packed struct(u4) {
+    /// Bit-packed page metadata - fits in single u16.
+    /// Flags in low 6 bits, segment index in high 10 bits.
+    pub const PackedInfo = packed struct(u16) {
+        /// Page is full (all blocks used), removed from bin queue
         in_full: bool = false,
-        has_aligned: bool = false,
-        in_purge_queue: bool = false,
+        /// Page is in heap's bin queue for its size class
         in_bin: bool = false,
+        /// This is a huge allocation (> 16MB, custom segment size)
+        is_huge: bool = false,
+        /// Page is claimed and in use by segment
+        segment_in_use: bool = false,
+        /// Physical memory is committed (not just reserved)
+        is_commited: bool = false,
+        /// Memory is zero-initialized (for calloc optimization)
+        is_zero_init: bool = false,
+        /// Index of this page within segment.pages[] array (max 1024)
+        segment_idx: u10 = 0,
     };
+
+    /// Doubly-linked list for bin queues
+    pub const Queue = list.DoublyLinkedListType(Page, .next, .prev);
+
+    /// Page size category - determines page size within segment
+    pub const PageKind = enum {
+        PAGE_SMALL, // 64KB pages, blocks 8-1024 bytes
+        PAGE_MEDIUM, // 512KB pages, blocks 1KB-128KB
+        PAGE_LARGE, // Full segment, blocks 128KB-16MB
+        PAGE_HUGE, // Variable segment, blocks > 16MB
+    };
+
+    inline fn info(self: *const Self) PackedInfo {
+        return @bitCast(self.flags_and_idx);
+    }
+
+    inline fn setInfo(self: *Self, i: PackedInfo) void {
+        self.flags_and_idx = @bitCast(i);
+    }
+
+    /// Get page's index within segment.pages[] array
+    pub inline fn segment_idx(self: *const Self) u10 {
+        return self.info().segment_idx;
+    }
+
+    /// Set page's index within segment.pages[] array
+    pub inline fn set_segment_idx(self: *Self, idx: u10) void {
+        var i = self.info();
+        i.segment_idx = idx;
+        self.setInfo(i);
+    }
 
     pub inline fn is_in_full(self: *const Self) bool {
-        return self.flags.page_flags.in_full;
+        return self.info().in_full;
     }
 
+    pub inline fn set_in_full(self: *Self, val: bool) void {
+        var i = self.info();
+        i.in_full = val;
+        self.setInfo(i);
+    }
+
+    pub inline fn is_in_bin(self: *const Self) bool {
+        return self.info().in_bin;
+    }
+
+    pub inline fn set_in_bin(self: *Self, val: bool) void {
+        var i = self.info();
+        i.in_bin = val;
+        self.setInfo(i);
+    }
+
+    pub inline fn is_huge(self: *const Self) bool {
+        return self.info().is_huge;
+    }
+
+    pub inline fn set_huge(self: *Self, val: bool) void {
+        var i = self.info();
+        i.is_huge = val;
+        self.setInfo(i);
+    }
+
+    pub inline fn is_segment_in_use(self: *const Self) bool {
+        return self.info().segment_in_use;
+    }
+
+    pub inline fn set_segment_in_use(self: *Self, val: bool) void {
+        var i = self.info();
+        i.segment_in_use = val;
+        self.setInfo(i);
+    }
+
+    pub inline fn is_commited(self: *const Self) bool {
+        return self.info().is_commited;
+    }
+
+    pub inline fn set_commited(self: *Self, val: bool) void {
+        var i = self.info();
+        i.is_commited = val;
+        self.setInfo(i);
+    }
+
+    pub inline fn is_zero_init(self: *const Self) bool {
+        return self.info().is_zero_init;
+    }
+
+    pub inline fn set_zero_init(self: *Self, val: bool) void {
+        var i = self.info();
+        i.is_zero_init = val;
+        self.setInfo(i);
+    }
+
+    // =========================================================================
+    // Bin Queue Management
+    // =========================================================================
+
+    /// Add page to heap's bin queue for its size class.
+    /// If already in bin, removes first to avoid duplicates.
     pub inline fn pagePushBin(self: *Self, hp: *heap.Heap, bin: usize) void {
-        if (self.flags.page_flags.in_bin) {
+        if (self.is_in_bin()) {
             hp.pages[bin].remove(self);
         }
-
         hp.pages[bin].push(self);
-        self.flags.page_flags.in_bin = true;
+        self.set_in_bin(true);
     }
 
+    /// Remove page from heap's bin queue.
+    /// Called when page becomes full or is being retired.
     pub inline fn pageRemoveFromBin(self: *Self, hp: *heap.Heap, bin: usize) void {
-        if (self.flags.page_flags.in_bin) {
+        if (self.is_in_bin()) {
             hp.pages[bin].remove(self);
-            self.flags.page_flags.in_bin = false;
+            self.set_in_bin(false);
         }
-    }
-
-    pub inline fn set_in_full(self: *Self, in_full: bool) void {
-        self.flags.page_flags.in_full = in_full;
-    }
-
-    pub inline fn is_aligned(self: *const Self) bool {
-        return self.flags.page_flags.has_aligned;
-    }
-
-    pub inline fn set_aligned(self: *Self, has_aligned: bool) void {
-        self.flags.page_flags.has_aligned = has_aligned;
     }
 
     /// Initialize page for use with given block size
@@ -163,54 +263,12 @@ pub const Page = struct {
             self.reserved = 0;
         }
 
-        // Calculate shift for power-of-2 sizes
-        if (block_size > 0 and (block_size & (block_size - 1)) == 0) {
-            self.block_size_shift = @intCast(@ctz(block_size));
-        } else {
-            self.block_size_shift = 0;
-        }
-
-        self.flags.free_is_zero = self.flags.is_zero_init;
-        self.retire_expire = 0;
         // Bump pointer handles initial allocation - no pre-extension needed
     }
 
     // =========================================================================
     // Free List Management
     // =========================================================================
-
-    /// Get block at index within page
-    pub inline fn blockAt(self: *const Self, idx: usize) ?*Block {
-        if (idx >= self.capacity) return null;
-        const start = self.page_start orelse return null;
-        return @ptrCast(@alignCast(start + idx * self.block_size));
-    }
-
-    /// Extend free list by adding more blocks
-    pub inline fn extendFree(self: *Self, extend_count: usize) void {
-        if (extend_count == 0) return;
-        const start = self.page_start orelse return;
-        const bsize = self.block_size;
-        if (bsize == 0) return;
-
-        const reserved = self.reserved;
-        const capacity = self.capacity;
-        if (reserved >= capacity) return;
-
-        const actual_extend = @min(extend_count, capacity - reserved);
-        const block_start = start + reserved * bsize;
-
-        // Add blocks to free list in reverse order for better pop locality
-        // (first block added = first block popped)
-        var i: usize = actual_extend;
-        while (i > 0) : (i -= 1) {
-            const block: *Block = @ptrCast(@alignCast(block_start + (i - 1) * bsize));
-            @prefetch(block, .{ .cache = .data, .locality = 3, .rw = .read });
-            self.free.push(block);
-        }
-
-        self.reserved += @intCast(actual_extend);
-    }
 
     /// Check if page has any free blocks (including bump pointer room)
     pub inline fn hasFree(self: *const Self) bool {
@@ -228,14 +286,6 @@ pub const Page = struct {
         return self.reserved < self.capacity or !self.free.empty();
     }
 
-    /// Collect thread-local free list into main free list
-    pub inline fn collectLocalFree(self: *Self) void {
-        // Move all from local_free to free
-        while (self.local_free.pop()) |block| {
-            self.free.push(block);
-        }
-    }
-
     /// Check if all blocks are used
     pub inline fn allUsed(self: *const Self) bool {
         return self.used >= self.capacity;
@@ -248,38 +298,26 @@ pub const Page = struct {
         return self.used <= self.capacity / 8;
     }
 
-    /// Collect cross-thread free list (atomic)
+    /// Collect cross-thread free list (atomic) - batch optimized
+    /// Instead of pushing blocks one-by-one, splice the entire list at once
     pub inline fn collectXthreadFree(self: *Self) usize {
-        var head = self.xthread_free.swap(null, .monotonic);
-        var count: usize = 0;
+        const head = self.xthread_free.swap(null, .acquire) orelse return 0;
 
-        while (head) |block| {
-            // Save next before clearing link (push asserts link.next == null)
-            const next_link = block.link.next;
-            const next: ?*Block = if (next_link) |link|
-                @alignCast(@fieldParentPtr("link", link))
-            else
-                null;
-
-            @prefetch(block, .{ .cache = .data, .locality = 3, .rw = .read });
-
-            self.free.push(block);
-            head = next;
+        // Find tail and count in single pass
+        var tail: *Block = head;
+        var count: usize = 1;
+        while (tail.link.next) |next_link| {
+            tail = @alignCast(@fieldParentPtr("link", next_link));
             count += 1;
         }
 
-        if (count > 0) {
-            self.used -|= @intCast(@min(count, self.used));
-        }
+        // Splice: tail.next = free.head, free.head = xthread_head
+        // This prepends entire xthread list to free in O(1) after the walk
+        tail.link.next = if (self.free.any.head) |h| h else null;
+        self.free.any.head = &head.link;
 
+        self.used -|= @intCast(@min(count, self.used));
         return count;
-    }
-
-    /// Collect all free lists
-    pub inline fn freeCollect(self: *Self, force: bool) void {
-        _ = force;
-        self.collectLocalFree();
-        _ = self.collectXthreadFree();
     }
 
     /// Free a block from another thread (lock-free)
@@ -327,6 +365,7 @@ pub const Page = struct {
     }
 
     inline fn popFreeBlockSlow(self: *Self) ?*Block {
+        @branchHint(.unlikely);
         // Move local_free to free
         if (!self.local_free.empty()) {
             @branchHint(.likely);
@@ -344,29 +383,27 @@ pub const Page = struct {
         // Try to collect cross-thread free blocks
         if (self.collectXthreadFree() > 0) {
             if (self.free.pop()) |block| {
+                @branchHint(.likely);
                 self.used += 1;
                 return block;
             }
         }
 
-        // If still empty and bump available, extend a batch
-        if (self.free.empty() and self.reserved < self.capacity) {
+        // Fallback: bump allocate directly
+        if (self.reserved < self.capacity) {
             @branchHint(.unlikely);
-            const BATCH_EXTEND: usize = 32;
-            const extend = @min(BATCH_EXTEND, self.capacity - self.reserved);
-            self.extendFree(extend);
-            if (self.free.pop()) |block| {
-                self.used += 1;
-                return block;
-            }
+            const start = self.page_start orelse return null;
+            const block: *Block = @ptrCast(@alignCast(start + @as(usize, self.reserved) * self.block_size));
+            self.reserved += 1;
+            self.used += 1;
+            return block;
         }
 
         return null;
     }
 
-    /// Push freed block directly to free list (same-thread, no swap needed)
+    /// Push freed block directly to local_free list
     pub inline fn pushFreeBlock(self: *Self, block: *Block) void {
-        // self.free.push(block);
         self.local_free.push(block);
         self.used -|= 1;
     }
@@ -378,19 +415,9 @@ pub const Page = struct {
         self.local_free = .init();
         self.xthread_free.store(null, .release);
         self.reserved = 0;
-        self.retire_expire = 0;
-        self.flags.page_flags = .{};
-    }
-
-    /// Check if page can be retired (mostly empty and not in full queue)
-    pub inline fn canRetire(self: *const Self) bool {
-        return self.isMostlyEmpty() and !self.is_in_full();
-    }
-
-    /// Get number of free blocks (includes bump-available)
-    pub inline fn freeCount(self: *const Self) usize {
-        const bump_available: usize = if (self.capacity > self.reserved) self.capacity - self.reserved else 0;
-        return self.free.count() + self.local_free.count() + bump_available;
+        // Clear all flags but keep segment_idx
+        const idx = self.segment_idx();
+        self.setInfo(.{ .segment_idx = idx });
     }
 
     /// Get utilization ratio (0.0 to 1.0)
@@ -445,18 +472,6 @@ pub fn blockSizeForBin(bin: usize) usize {
     return wsize * types.INTPTR_SIZE;
 }
 
-/// Get small page size for a given block size
-pub fn smallPageSizeFor(block_size: usize) usize {
-    _ = block_size;
-    return types.SMALL_PAGE_SIZE;
-}
-
-/// Get medium page size for a given block size
-pub fn mediumPageSizeFor(block_size: usize) usize {
-    _ = block_size;
-    return types.MEDIUM_PAGE_SIZE;
-}
-
 /// Check if size qualifies for small allocation
 pub inline fn isSmallSize(size: usize) bool {
     return size <= types.SMALL_OBJ_SIZE_MAX;
@@ -483,17 +498,6 @@ pub fn pageKindForSize(size: usize) Page.PageKind {
     if (isMediumSize(size)) return .PAGE_MEDIUM;
     if (isLargeSize(size)) return .PAGE_LARGE;
     return .PAGE_HUGE;
-}
-
-/// Move page to end of queue (most recently accessed - for cache efficiency)
-pub inline fn queueMoveToEnd(queue: *Page.Queue, page: *Page) void {
-    if (queue.tail == page) return;
-
-    // Remove from current position
-    queue.remove(page);
-
-    // Add to end (tail)
-    queue.push(page);
 }
 
 /// Find first page with free blocks in queue (iterates from tail via prev)
@@ -526,37 +530,28 @@ test "Page: basic initialization" {
     try testing.expectEqual(@as(u16, 0), page.used);
 }
 
-test "Page: power of 2 block size shift" {
+test "Page: flag accessors" {
     var page: Page = .{};
-    var buffer: [256]u8 align(16) = undefined;
 
-    page.init(16, &buffer, 256);
-    try testing.expectEqual(@as(u8, 4), page.block_size_shift); // log2(16) = 4
+    // Test all flag accessors
+    try testing.expect(!page.is_in_full());
+    page.set_in_full(true);
+    try testing.expect(page.is_in_full());
 
-    page.init(64, &buffer, 256);
-    try testing.expectEqual(@as(u8, 6), page.block_size_shift); // log2(64) = 6
+    try testing.expect(!page.is_huge());
+    page.set_huge(true);
+    try testing.expect(page.is_huge());
 
-    // Non-power-of-2
-    page.init(48, &buffer, 256);
-    try testing.expectEqual(@as(u8, 0), page.block_size_shift);
-}
+    try testing.expect(!page.is_commited());
+    page.set_commited(true);
+    try testing.expect(page.is_commited());
 
-test "Page: extendFree" {
-    var page: Page = .{};
-    var buffer: [512]u8 align(16) = undefined;
-
-    page.init(64, &buffer, 512);
-    page.reserved = 0; // Reset reserved to test extension
-
-    try testing.expect(page.free.empty());
-
-    page.extendFree(4);
-
-    try testing.expectEqual(@as(u16, 4), page.reserved);
-    try testing.expect(!page.free.empty());
-
-    // Count free blocks using count() method
-    try testing.expectEqual(@as(u64, 4), page.free.count());
+    // Test segment_idx packing
+    page.set_segment_idx(100);
+    try testing.expectEqual(@as(u10, 100), page.segment_idx());
+    // Flags should still be set
+    try testing.expect(page.is_in_full());
+    try testing.expect(page.is_huge());
 }
 
 test "Page: popFreeBlock and pushFreeBlock" {
@@ -564,10 +559,8 @@ test "Page: popFreeBlock and pushFreeBlock" {
     var buffer: [256]u8 align(16) = undefined;
 
     page.init(32, &buffer, 256);
-    page.reserved = 0;
-    page.extendFree(4);
 
-    // Pop blocks
+    // Pop blocks via bump allocation
     const b1 = page.popFreeBlock();
     try testing.expect(b1 != null);
     try testing.expectEqual(@as(u16, 1), page.used);
@@ -576,11 +569,11 @@ test "Page: popFreeBlock and pushFreeBlock" {
     try testing.expect(b2 != null);
     try testing.expectEqual(@as(u16, 2), page.used);
 
-    // Push back
+    // Push back (goes to local_free)
     page.pushFreeBlock(b1.?);
     try testing.expectEqual(@as(u16, 1), page.used);
 
-    // Pop again
+    // Pop again (from local_free via slow path)
     const b3 = page.popFreeBlock();
     try testing.expect(b3 != null);
     try testing.expectEqual(@as(u16, 2), page.used);
@@ -708,10 +701,9 @@ test "queueFindFree" {
     var buffer: [64]u8 align(8) = undefined;
 
     var p1: Page = .{ .capacity = 10, .used = 10, .reserved = 10 }; // Full (bump exhausted)
-    var p2: Page = .{ .capacity = 10, .used = 5 }; // Partially used
+    var p2: Page = .{}; // Has free space
     p2.init(8, &buffer, 64);
-    p2.reserved = 0;
-    p2.extendFree(2);
+    // p2 has reserved=0 < capacity, so hasFree() is true
 
     queue.push(&p1);
     queue.push(&p2);

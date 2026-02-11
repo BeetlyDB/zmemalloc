@@ -163,18 +163,6 @@ pub const MAX_ALLOC_SIZE: usize = blk: {
     }
 };
 
-/// Delayed free state for multi-threaded free operations
-pub const DelayedFree = enum(u2) {
-    /// Push on the owning heap thread delayed list
-    use_delayed_free = 0,
-    /// Temporary: another thread is accessing the owning heap
-    delayed_freeing = 1,
-    /// Optimize: push on page local thread free queue
-    no_delayed_free = 2,
-    /// Sticky: used for abandoned pages without owning heap
-    never_delayed_free = 3,
-};
-
 comptime {
     // Verify segment layout
     if (SEGMENT_SIZE != SLICES_PER_SEGMENT * SEGMENT_SLICE_SIZE) {
