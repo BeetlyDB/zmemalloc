@@ -1,3 +1,42 @@
+//! # Arena Allocator
+//!
+//! Large contiguous memory regions for huge allocations (>= 16 MiB).
+//! Arenas provide efficient allocation of very large objects that don't
+//! fit into the standard segment/page hierarchy.
+//!
+//! ## Memory Layout
+//!
+//! ```
+//! Arena (N × 32 MiB blocks):
+//! ┌─────────┬─────────┬─────────┬─────────┬───────┐
+//! │ Block 0 │ Block 1 │ Block 2 │   ...   │Block N│
+//! │ (32 MiB)│ (32 MiB)│ (32 MiB)│         │(32MiB)│
+//! └─────────┴─────────┴─────────┴─────────┴───────┘
+//! ```
+//!
+//! ## Bitmap Tracking
+//!
+//! Each arena uses multiple bitmaps for tracking block state:
+//!
+//! | Bitmap            | Purpose                                      |
+//! |-------------------|----------------------------------------------|
+//! | `blocks_inuse`    | Which blocks are currently allocated         |
+//! | `blocks_dirty`    | Which blocks have been written to            |
+//! | `blocks_committed`| Which blocks are backed by physical memory   |
+//! | `blocks_purge`    | Which blocks are scheduled for decommit      |
+//! | `blocks_abandoned`| Which blocks belong to abandoned segments    |
+//!
+//! ## Deferred Purge
+//!
+//! When blocks are freed, they're not immediately returned to the OS.
+//! Instead, they're scheduled for purge after `PURGE_DELAY_MS` (100ms).
+//! This avoids expensive decommit/recommit cycles for rapidly reused memory.
+//!
+//! ## Thread Safety
+//!
+//! Arenas use atomic operations and lock-free algorithms for most operations.
+//! The `Arenas` collection can be accessed from any thread safely.
+
 const std = @import("std");
 const MemID = @import("mem.zig").MemID;
 const Mutex = @import("mutex.zig").Mutex;
@@ -12,12 +51,13 @@ const os = @import("os.zig");
 const Atomic = std.atomic.Value;
 const Allocator = std.mem.Allocator;
 
+/// Maximum number of arenas that can be registered
 pub const MAX_ARENAS: usize = 256;
 pub const ARENA_BLOCK_SIZE: usize = types.SEGMENT_SIZE; // 32 MiB
 pub const ARENA_MIN_OBJ_SIZE: usize = ARENA_BLOCK_SIZE / 2; // 16 MiB minimum for arena alloc
 
-/// Default purge delay in milliseconds (10 seconds)
-pub const PURGE_DELAY_MS: i64 = 10 * 1000;
+/// Default purge delay in milliseconds
+pub const PURGE_DELAY_MS: i64 = 100;
 
 pub const Arenas = struct {
     const Self = @This();

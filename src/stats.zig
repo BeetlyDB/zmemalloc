@@ -1,10 +1,47 @@
+//! # Allocation Statistics
+//!
+//! Thread-local statistics for tracking allocator behavior.
+//! Useful for debugging, profiling, and understanding memory usage patterns.
+//!
+//! ## Stat Types
+//!
+//! - `StatCount`: Tracks current, total, and peak values (for allocation sizes)
+//! - `StatCounter`: Monotonically increasing counter (for call counts)
+//!
+//! ## Tracked Metrics
+//!
+//! ### Memory Metrics
+//! - `reserved`: Virtual memory reserved via mmap
+//! - `committed`: Physical memory committed (backed by RAM)
+//! - `pages`: Pages currently allocated
+//! - `segments`: Segments currently in use
+//!
+//! ### Allocation Metrics
+//! - `malloc_normal`: Normal allocations (small/medium)
+//! - `malloc_huge`: Huge allocations (> 16 MiB)
+//! - `malloc_bins[bin]`: Per-size-class allocation stats
+//!
+//! ### Operation Counters
+//! - `mmap_calls`: Number of mmap syscalls
+//! - `commit_calls`: Number of commit operations
+//! - `purge_calls`: Number of purge (decommit) operations
+//!
+//! ## Usage
+//!
+//! Statistics are accessed via `main_stats` thread-local variable:
+//! ```zig
+//! stats.main_stats.addCount(.committed, size);
+//! stats.main_stats.incCounter(.mmap_calls);
+//! ```
+
 const std = @import("std");
 const assert = @import("util.zig").assert;
 const types = @import("types.zig");
 
 const BIN_HUGE = types.BIN_HUGE;
 
-// count allocation over time
+/// Tracks current, total, and peak values
+/// Used for metrics that go up and down (like memory usage)
 pub const StatCount = struct {
     total: i64 = 0,
     peak: i64 = 0,

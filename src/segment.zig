@@ -1,3 +1,40 @@
+//! # Segment Management
+//!
+//! Segments are 32MB memory regions that contain multiple pages.
+//! They are the unit of OS memory allocation and thread ownership.
+//!
+//! ## Memory Hierarchy
+//!
+//! ```
+//! Arena (optional, 256MB+)
+//!   └── Segment (32MB, aligned)
+//!         ├── Segment Header (metadata, pages array)
+//!         ├── Page 0 (64KB for small, 512KB for medium)
+//!         ├── Page 1
+//!         └── ...
+//! ```
+//!
+//! ## Segment Types by Page Size
+//!
+//! - **Small**: 64KB pages, for blocks 8-1024 bytes
+//! - **Medium**: 512KB pages, for blocks 1KB-128KB
+//! - **Large**: Single page spanning full segment, for blocks 128KB-16MB
+//! - **Huge**: Variable size segment, for blocks > 16MB
+//!
+//! ## Thread Ownership
+//!
+//! Each segment is owned by a single thread (stored in `thread_id`).
+//! When a thread exits, its segments are "abandoned" and can be
+//! reclaimed by other threads via the global abandoned queue.
+//!
+//! ## Pointer to Segment Lookup
+//!
+//! For standard segments (32MB aligned), finding the segment from a pointer
+//! is a simple bit mask: `ptr & ~SEGMENT_MASK`.
+//!
+//! For huge segments (> 32MB), a global registry is used since the
+//! segment boundary can't be determined from the pointer alone.
+
 const std = @import("std");
 const builtin = @import("builtin");
 const types = @import("types.zig");
@@ -106,6 +143,10 @@ pub const Segment = struct {
     // Link for QueueType (spans list)
     link: queue.IntrusiveLifo(Self).Link = .{},
 
+    // Link for all_segments list (tracks ALL segments owned by thread)
+    all_next: ?*Self = null,
+    all_prev: ?*Self = null,
+
     // Segment state
     was_reclaimed: bool = false,
     dont_free: bool = false,
@@ -125,6 +166,8 @@ pub const Segment = struct {
     // Layout optimized for free() access - cache line aligned
     // Use usize for thread_id to allow TLD address (faster than syscall)
     thread_id: Atomic(usize) align(std.atomic.cache_line) = .init(0),
+    /// Owning thread's heap - atomic for safe cross-thread access in xthreadFree
+    heap: Atomic(?*@import("heap.zig").Heap) = .init(null),
     page_shift: usize = 0,
     page_kind: PageKind = .small,
     header_slices: usize = 0, // Pre-computed for fast pageFromPtr
@@ -271,7 +314,7 @@ pub const Segment = struct {
         const start = self.rawPageStart(pg, &psize);
 
         const ptr: [*]align(std.heap.page_size_min) u8 = @alignCast(start);
-        std.posix.madvise(ptr, psize, std.posix.MADV.DONTNEED) catch {};
+        std.posix.madvise(ptr, psize, std.posix.MADV.FREE) catch {};
         pg.set_commited(false);
     }
 
@@ -282,8 +325,8 @@ pub const Segment = struct {
         // Memory is already mapped, just mark as committed
         pg.set_commited(true);
         pg.used = 0;
-        pg.free = .init();
-        pg.local_free = .init();
+        // pg.free = .init();
+        // pg.local_free = .init();
         pg.set_zero_init(false);
         return true;
     }
@@ -293,8 +336,8 @@ pub const Segment = struct {
         // Clear all flags, keep segment_idx
         pg.flags_and_idx = @bitCast(Page.PackedInfo{ .segment_idx = page_idx });
         pg.xthread_free.store(null, .release);
-        pg.free = .init();
-        pg.local_free = .init();
+        pg.free_head = null;
+        pg.local_free_head = null;
         pg.block_size = 0;
         pg.page_start = null;
         pg.capacity = 0;
@@ -496,6 +539,7 @@ pub const Segment = struct {
 pub const SegmentList = queue.IntrusiveLifo(Segment);
 pub const SegmentAbandonedQueue = queue.Intrusive(Segment, .abandoned_os_next, .abandoned_os_prev);
 pub const SegmentQueue = queue.DoublyLinkedListType(Segment, .next, .prev);
+pub const AllSegmentsList = queue.DoublyLinkedListType(Segment, .all_next, .all_prev);
 
 // =============================================================================
 // Segments Thread-Local Data
@@ -509,6 +553,9 @@ pub const SegmentsTLD = struct {
     medium_free: SegmentQueue = .{},
     large_free: SegmentQueue = .{}, // Cache for large segments (one page per segment)
 
+    // List of ALL segments owned by this thread (for xthread_free collection)
+    all_segments: AllSegmentsList = .{},
+
     // spans per size bin
     spans: [types.SEGMENTS_BIN_MAX + 1]SegmentList = [_]SegmentList{SegmentList.init()} ** (types.SEGMENTS_BIN_MAX + 1),
 
@@ -521,6 +568,9 @@ pub const SegmentsTLD = struct {
     // stats: ?*Stats = null,
 
     os_alloc: std.mem.Allocator = undefined,
+
+    // Owning heap (for xthread_free collection)
+    heap: ?*@import("heap.zig").Heap = null,
 
     // Fast thread ID (TLD address) - set during init, avoids syscall
     thread_id: usize = 0,
@@ -700,14 +750,14 @@ pub const SegmentsTLD = struct {
         for (0..capacity) |i| {
             var pg = &segment.pages[i];
             pg.* = .{
-                .free = .init(),
+                .free_head = null,
                 .page_start = null,
                 .block_size = 0,
                 .capacity = 0,
                 .reserved = 0,
                 .used = 0,
                 .flags_and_idx = 0,
-                .local_free = .init(),
+                .local_free_head = null,
                 .xthread_free = .init(null),
                 .next = null,
                 .prev = null,
@@ -722,6 +772,12 @@ pub const SegmentsTLD = struct {
         if (page_kind == .huge and segment_size > types.SEGMENT_SIZE) {
             huge_registry.register(segment);
         }
+
+        // Set heap pointer for xthread_free collection
+        segment.heap.store(self.heap, .release);
+
+        // Add to all_segments list for iteration during collection
+        self.all_segments.push(segment);
 
         self.trackSize(@intCast(segment_size));
         return segment;
@@ -739,6 +795,9 @@ pub const SegmentsTLD = struct {
         }
 
         self.removeFromFreeQueue(segment);
+
+        // Remove from all_segments list
+        self.all_segments.remove(segment);
 
         // Purge all uncommitted pages
         if (force and !segment.memid.flags.is_pinned) {
@@ -854,8 +913,8 @@ pub const SegmentsTLD = struct {
             pg.capacity = 0;
             pg.reserved = 0;
             pg.used = 0;
-            pg.free = .init();
-            pg.local_free = .init();
+            pg.free_head = null;
+            pg.local_free_head = null;
             pg.xthread_free.store(null, .release);
             pg.next = null;
             pg.prev = null;
@@ -904,8 +963,8 @@ pub const SegmentsTLD = struct {
             pg.capacity = 0;
             pg.reserved = 0;
             pg.used = 0;
-            pg.free = .init();
-            pg.local_free = .init();
+            pg.free_head = null;
+            pg.local_free_head = null;
             pg.xthread_free.store(null, .release);
             pg.next = null;
             pg.prev = null;
@@ -1064,6 +1123,32 @@ pub const SegmentsTLD = struct {
         }
 
         return collected;
+    }
+
+    /// Collect xthread_free from ALL pages in ALL segments owned by this thread.
+    /// This is critical for reclaiming memory freed by other threads.
+    /// Returns total number of blocks collected.
+    pub fn collectAllXthreadFree(self: *Self) usize {
+        var total_collected: usize = 0;
+
+        var segment = self.all_segments.tail;
+        while (segment) |seg| {
+            const next = seg.all_prev;
+
+            for (0..seg.capacity) |i| {
+                const pg = &seg.pages[i];
+                if (pg.is_segment_in_use()) {
+                    // Check if there are pending xthread frees
+                    if (pg.xthread_free.load(.monotonic) != null) {
+                        total_collected += pg.collectXthreadFree();
+                    }
+                }
+            }
+
+            segment = next;
+        }
+
+        return total_collected;
     }
 
     /// Schedule a page for delayed purging

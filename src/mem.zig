@@ -1,7 +1,35 @@
+//! # Memory Identification
+//!
+//! Tracking structure for memory provenance and attributes.
+//! Every allocated memory region has an associated MemID that
+//! describes where it came from and its properties.
+//!
+//! ## Memory Kinds
+//!
+//! | Kind         | Source              | Can Decommit | Notes                |
+//! |--------------|---------------------|--------------|----------------------|
+//! | MEM_NONE     | Not allocated       | N/A          | Default/invalid      |
+//! | MEM_EXTERNAL | External provider   | No           | User-provided memory |
+//! | MEM_STATIC   | Static allocation   | No           | Compile-time memory  |
+//! | MEM_OS       | Direct mmap         | Yes          | Normal OS pages      |
+//! | MEM_OS_HUGE  | Huge pages (1 GiB)  | No           | Pinned, no decommit  |
+//! | MEM_OS_REMAP | Remappable (mremap) | Yes          | Supports resize      |
+//! | MEM_ARENA    | Arena allocator     | Yes          | Via arena's blocks   |
+//!
+//! ## Flags
+//!
+//! - `is_pinned`: Cannot decommit/reset (huge pages)
+//! - `initially_committed`: Was originally backed by physical memory
+//! - `initially_zero`: Was originally zero-initialized
+
 const std = @import("std");
 const builtin = @import("builtin");
 const assert = @import("util.zig").assert;
 
+/// Memory identification and provenance tracking
+///
+/// Stores information about where memory came from and its attributes.
+/// Used to properly handle decommit, reset, and freeing operations.
 pub const MemID = struct {
     memkind: MemKind = .MEM_NONE,
     flags: Flags = .{},

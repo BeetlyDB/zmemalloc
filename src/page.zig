@@ -1,12 +1,51 @@
-//! Page and Block management for zmemalloc.
+//! # Page and Block Management
 //!
-//! A Page is a region within a segment that holds fixed-size blocks.
-//! Pages use three-level free list sharding for optimal performance:
-//! - `free`: main free list for recycled blocks
-//! - `local_free`: same-thread freed blocks (merged into free on demand)
-//! - `xthread_free`: cross-thread freed blocks (atomic, lock-free)
+//! Pages are the core allocation unit in zmemalloc. Each page contains
+//! fixed-size blocks of a single size class.
 //!
-//! Allocation uses bump pointer for fresh pages, then recycles from free lists.
+//! ## Memory Layout
+//!
+//! ```
+//! Segment (32MB)
+//! ┌─────────────────────────────────────────────────────────────┐
+//! │ Segment Header │ Page 0 │ Page 1 │ Page 2 │ ... │ Page N    │
+//! └─────────────────────────────────────────────────────────────┘
+//!                      │
+//!                      ▼
+//!                  Page (64KB/512KB)
+//!                  ┌─────────────────────────────────────────┐
+//!                  │ Block │ Block │ Block │ ... │ Block     │
+//!                  └─────────────────────────────────────────┘
+//! ```
+//!
+//! ## Three-Level Free List Sharding
+//!
+//! For optimal multi-threaded performance, each page has three free lists:
+//!
+//! 1. **`free`**: Main free list for allocation (LIFO stack)
+//! 2. **`local_free`**: Same-thread frees (merged into `free` when empty)
+//! 3. **`xthread_free`**: Cross-thread frees (atomic, lock-free)
+//!
+//! This design minimizes contention: allocations only touch `free`,
+//! same-thread frees go to `local_free`, and only cross-thread frees
+//! require atomic operations.
+//!
+//! ## Allocation Strategy
+//!
+//! 1. Pop from `free` list (hot path)
+//! 2. Bump pointer for fresh pages (sequential memory access)
+//! 3. Merge `local_free` into `free` (when `free` empty)
+//! 4. Collect `xthread_free` (atomic swap, cold path)
+//!
+//! ## Block Structure
+//!
+//! ```
+//! Allocated:  [=========== user data ===========]
+//! Free:       [next_ptr][====== unused ========]
+//! ```
+//!
+//! The same memory serves as user data when allocated, or as a linked
+//! list node when free. No separate metadata needed.
 
 const std = @import("std");
 const list = @import("queue.zig");
@@ -16,57 +55,13 @@ const builtin = @import("builtin");
 const assert = @import("util.zig").assert;
 const heap = @import("heap.zig");
 
-//TODO: add more documentation on each function and use sep
+/// Global counter of pending cross-thread frees
+/// When this exceeds a threshold, triggers collection in malloc path
+pub var pending_xthread_free: Atomic(usize) = .init(0);
 
-/// Intrusive free block structure.
-/// When memory is free, first 8 bytes contain pointer to next free block.
-/// When allocated, user owns entire block including these bytes.
-//------------------------------------------------------------------------------------
-//
-// Allocated memory (64 bytes):
-// ┌────────────────────────────────────────────────────────────────┐
-// │                          Data                                  │
-// └────────────────────────────────────────────────────────────────┘
-//
-// Free memory (same 64 bytes):
-// ┌──────────┬─────────────────────────────────────────────────────┐
-// │  *Block  │              not used                               │
-// │  .link   │                                                     │
-// └──────────┴─────────────────────────────────────────────────────┘
-//      ↓
-//    next free block
-//
-// How used:
-//
-// const Block = struct {
-//     link: queue.QueueType(Block).Link = .{},
-// };
-//
-// // free  - cast to block
-// pub fn free(ptr: [*]u8) void {
-//     const block: *Block = @ptrCast(@alignCast(ptr));
-//
-//     // add in free list
-//     page.free.push(block);
-// }
-//
-// // Allocate memory - take block from free list
-// pub fn alloc() ?[*]u8 {
-//     const block = page.free.pop() orelse return null;
-//
-//
-//     return @ptrCast(block);
-// }
-//
-// I:
-// - *Block and [*]u8 point to same address
-// - When memory freed — first 8  bytes its link.next
-// - When memory allocated — user uses all memory
-//
-//
-
-//------------------------------------------------------------------------------------
-
+/// Intrusive free block node
+/// When memory is free, the first 8 bytes store a pointer to the next free block.
+/// When allocated, user owns the entire block including these bytes.
 pub const Block = struct {
     link: list.IntrusiveLifo(Block).Link = .{},
 };
@@ -83,8 +78,8 @@ pub const Page = struct {
     const Self = @This();
 
     // === Hot path fields (32 bytes) ===
-    /// Main free list - recycled blocks ready for reuse
-    free: list.IntrusiveLifo(Block) = .init(),
+    /// Main free list head pointer (IntrusiveLifoLink*)
+    free_head: ?*anyopaque = null,
     /// Start of allocatable memory area within segment
     page_start: ?[*]u8 = null,
     /// Size of each block in this page (all blocks same size)
@@ -99,8 +94,8 @@ pub const Page = struct {
     flags_and_idx: u16 = 0,
 
     // === Queue fields (32 bytes) ===
-    /// Same-thread freed blocks - merged into `free` when `free` is empty
-    local_free: list.IntrusiveLifo(Block) = .init(),
+    /// Same-thread freed blocks head pointer
+    local_free_head: ?*anyopaque = null,
     /// Cross-thread freed blocks - atomic lock-free list
     xthread_free: Atomic(?*Block) = .init(null),
     /// Next page in heap's bin queue
@@ -229,6 +224,7 @@ pub const Page = struct {
     /// Add page to heap's bin queue for its size class.
     /// If already in bin, removes first to avoid duplicates.
     pub inline fn pagePushBin(self: *Self, hp: *heap.Heap, bin: usize) void {
+        @setEvalBranchQuota(10_000);
         if (self.is_in_bin()) {
             hp.pages[bin].remove(self);
         }
@@ -250,8 +246,8 @@ pub const Page = struct {
         self.block_size = block_size;
         self.page_start = page_start;
         self.used = 0;
-        self.free = .init();
-        self.local_free = .init();
+        self.free_head = null;
+        self.local_free_head = null;
         self.xthread_free.store(null, .release);
 
         // Calculate capacity
@@ -270,12 +266,22 @@ pub const Page = struct {
     // Free List Management
     // =========================================================================
 
+    /// Check if free list is empty
+    inline fn freeEmpty(self: *const Self) bool {
+        return self.free_head == null;
+    }
+
+    /// Check if local_free list is empty
+    inline fn localFreeEmpty(self: *const Self) bool {
+        return self.local_free_head == null;
+    }
+
     /// Check if page has any free blocks (including bump pointer room)
     pub inline fn hasFree(self: *const Self) bool {
         // Bump pointer has room (cheapest check - register comparison)
         if (self.reserved < self.capacity) return true;
         // Free list (recycled + same-thread freed blocks)
-        if (!self.free.empty()) return true;
+        if (!self.freeEmpty()) return true;
         // Cross-thread free list (cold path)
         return self.xthread_free.load(.monotonic) != null;
     }
@@ -283,7 +289,7 @@ pub const Page = struct {
     /// Quick check without atomic xthread load — for hot allocation path.
     /// Cross-thread freed blocks will be collected on next popFreeBlockSlow().
     pub inline fn hasFreeQuick(self: *const Self) bool {
-        return self.reserved < self.capacity or !self.free.empty();
+        return self.reserved < self.capacity or !self.freeEmpty();
     }
 
     /// Check if all blocks are used
@@ -313,10 +319,14 @@ pub const Page = struct {
 
         // Splice: tail.next = free.head, free.head = xthread_head
         // This prepends entire xthread list to free in O(1) after the walk
-        tail.link.next = if (self.free.any.head) |h| h else null;
-        self.free.any.head = &head.link;
+        tail.link.next = @ptrCast(@alignCast(self.free_head));
+        self.free_head = &head.link;
 
-        self.used -= @intCast(@min(count, self.used));
+        self.used -|= @intCast(@min(count, self.used));
+
+        // Decrement global pending counter
+        _ = pending_xthread_free.fetchSub(count, .monotonic);
+
         return count;
     }
 
@@ -333,19 +343,64 @@ pub const Page = struct {
                 .release,
                 .acquire,
             ) == null) {
-                // Success
+                // Success - increment global pending counter
+                _ = pending_xthread_free.fetchAdd(1, .monotonic);
                 break;
             }
         }
     }
 
+    /// Pop from free list - simple linked list, no branching
+    inline fn popFromFreeList(self: *Self) ?[*]u8 {
+        const link: ?*list.IntrusiveLifoLink = @ptrCast(@alignCast(self.free_head));
+        if (link) |l| {
+            self.free_head = l.next;
+            if (l.next) |next| {
+                @prefetch(next, .{ .cache = .data, .locality = 3, .rw = .read });
+            }
+            return @ptrCast(l);
+        }
+        return null;
+    }
+
+    /// Push to free list - simple linked list
+    inline fn pushToFreeList(self: *Self, block: [*]u8) void {
+        const link: *list.IntrusiveLifoLink = @ptrCast(@alignCast(block));
+        link.next = @ptrCast(@alignCast(self.free_head));
+        self.free_head = link;
+    }
+
+    /// Push to local_free list - simple linked list
+    inline fn pushToLocalFreeList(self: *Self, block: [*]u8) void {
+        const link: *list.IntrusiveLifoLink = @ptrCast(@alignCast(block));
+        link.next = @ptrCast(@alignCast(self.local_free_head));
+        self.local_free_head = link;
+    }
+
+    /// Pop from local_free list
+    inline fn popFromLocalFreeList(self: *Self) ?[*]u8 {
+        const link: ?*list.IntrusiveLifoLink = @ptrCast(@alignCast(self.local_free_head));
+        if (link) |l| {
+            self.local_free_head = l.next;
+            return @ptrCast(l);
+        }
+        return null;
+    }
+
+    /// Swap free and local_free lists
+    inline fn swapFreeLists(self: *Self) void {
+        const temp = self.free_head;
+        self.free_head = self.local_free_head;
+        self.local_free_head = temp;
+    }
+
     /// Pop a free block - hot path with bump pointer
     pub inline fn popFreeBlock(self: *Self) ?*Block {
         // Hot path 1: pop from free list (recycled blocks)
-        if (self.free.pop()) |block| {
+        if (self.popFromFreeList()) |block_ptr| {
             @branchHint(.likely);
             self.used += 1;
-            return block;
+            return @ptrCast(@alignCast(block_ptr));
         }
 
         // Hot path 2: bump allocate fresh contiguous block (no cache miss)
@@ -367,25 +422,23 @@ pub const Page = struct {
     inline fn popFreeBlockSlow(self: *Self) ?*Block {
         @branchHint(.unlikely);
         // Move local_free to free
-        if (!self.local_free.empty()) {
+        if (!self.localFreeEmpty()) {
             @branchHint(.likely);
             // Swap the lists - local_free becomes new free
-            const temp = self.free;
-            self.free = self.local_free;
-            self.local_free = temp;
-            if (self.free.pop()) |block| {
+            self.swapFreeLists();
+            if (self.popFromFreeList()) |block_ptr| {
                 @branchHint(.likely);
                 self.used += 1;
-                return block;
+                return @ptrCast(@alignCast(block_ptr));
             }
         }
 
         // Try to collect cross-thread free blocks
         if (self.collectXthreadFree() > 0) {
-            if (self.free.pop()) |block| {
+            if (self.popFromFreeList()) |block_ptr| {
                 @branchHint(.likely);
                 self.used += 1;
-                return block;
+                return @ptrCast(@alignCast(block_ptr));
             }
         }
 
@@ -405,15 +458,16 @@ pub const Page = struct {
     /// Push freed block directly to local_free list
     /// Note: uses regular decrement (not saturating) since used is always >= 1 when freeing
     pub inline fn pushFreeBlock(self: *Self, block: *Block) void {
-        self.local_free.push(block);
+        @setRuntimeSafety(false);
+        self.pushToLocalFreeList(@ptrCast(block));
         self.used -= 1;
     }
 
     /// Reset page to initial state
     pub inline fn reset(self: *Self) void {
         self.used = 0;
-        self.free = .init();
-        self.local_free = .init();
+        self.free_head = null;
+        self.local_free_head = null;
         self.xthread_free.store(null, .release);
         self.reserved = 0;
         // Clear all flags but keep segment_idx
@@ -521,7 +575,7 @@ const testing = std.testing;
 
 test "Page: basic initialization" {
     var page: Page = .{};
-    var buffer: [1024]u8 align(16) = undefined;
+    var buffer: [1024]u8 align(64) = undefined;
 
     page.init(64, &buffer, 1024);
 
@@ -582,9 +636,9 @@ test "Page: popFreeBlock and pushFreeBlock" {
 
 test "Page: hasFree and allUsed" {
     var page: Page = .{};
-    var buffer: [128]u8 align(16) = undefined;
+    var buffer: [128]u8 align(8) = undefined;
 
-    page.init(32, &buffer, 128);
+    page.init(32, &buffer, 128); // small blocks, linked list mode
     // capacity=4 (128/32), reserved=0, so bump has room
     try testing.expect(page.hasFree());
 
@@ -701,7 +755,7 @@ test "queueFindFree" {
     var queue: Page.Queue = .{};
     var buffer: [64]u8 align(8) = undefined;
 
-    var p1: Page = .{ .capacity = 10, .used = 10, .reserved = 10 }; // Full (bump exhausted)
+    var p1: Page = .{ .capacity = 10, .used = 10, .reserved = 10, .block_size = 8 }; // Full (bump exhausted)
     var p2: Page = .{}; // Has free space
     p2.init(8, &buffer, 64);
     // p2 has reserved=0 < capacity, so hasFree() is true

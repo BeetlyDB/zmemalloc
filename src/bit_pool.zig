@@ -1,3 +1,38 @@
+//! # Atomic Bitmap Pool
+//!
+//! Lock-free bitmap data structures for concurrent bit manipulation.
+//! Used throughout the allocator for tracking allocation state.
+//!
+//! ## Bitmap Types
+//!
+//! | Type          | Bits | Storage | Use Case                        |
+//! |---------------|------|---------|----------------------------------|
+//! | SmallBitmap   | 64   | Stack   | Single-word tracking             |
+//! | MediumBitmap  | 256  | Stack   | Medium-sized pools               |
+//! | LargeBitmap   | 1024 | Stack   | Larger fixed pools               |
+//! | SliceBitmap   | 512  | Stack   | Segment slice tracking           |
+//! | DynamicBitmap | N    | Heap    | Runtime-sized (arenas)           |
+//!
+//! ## Operations
+//!
+//! - `tryClaim(idx, count)`: Atomically set bits if all are clear
+//! - `unclaim(idx, count)`: Atomically clear bits
+//! - `isClaimed(idx, count)`: Check if all bits are set
+//! - `tryFindAndClaim(count)`: Find and claim first available range
+//!
+//! ## Atomicity
+//!
+//! All operations use atomic compare-and-swap for thread safety.
+//! Multi-field operations roll back on failure to maintain consistency.
+//!
+//! ## Memory Layout
+//!
+//! ```
+//! Field 0:  [b0 b1 b2 ... b63]
+//! Field 1:  [b64 b65 ... b127]
+//! ...
+//! ```
+
 const std = @import("std");
 const assert = @import("util.zig").assert;
 const Atomic = std.atomic.Value;
@@ -396,7 +431,7 @@ pub fn AtomicBitmap(comptime num_bits: usize, comptime is_stack: bool) type {
         }
 
         /// Atomically unclaim (clear) a sequence of bits
-        pub fn unclaim(
+        pub inline fn unclaim(
             self: *Self,
             bit_idx: usize,
             count: usize,

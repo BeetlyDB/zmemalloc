@@ -1,3 +1,44 @@
+//! # Internal Allocator
+//!
+//! Thread-safe bump allocator for allocator metadata structures.
+//! Uses a static buffer with lock-free CAS operations, falling back
+//! to OS allocation (mmap) when the buffer is exhausted.
+//!
+//! ## Design
+//!
+//! ```
+//! Static Buffer (256 KiB):
+//! ┌──────────────────────────────────────────┬──────────┐
+//! │        Allocated Metadata                │  Free    │
+//! │ (Arena structs, bitmaps, etc.)           │  Space   │
+//! └──────────────────────────────────────────┴──────────┘
+//!                                            ▲
+//!                                       end_index (atomic)
+//! ```
+//!
+//! ## Lock-Free Operations
+//!
+//! - `alloc`: Atomic CAS to bump end_index
+//! - `free`: Only frees last allocation (bump semantics)
+//! - `resize`: Only works for last allocation
+//!
+//! ## Fallback
+//!
+//! When static buffer is exhausted, allocations go directly to OS
+//! via mmap. These are properly freed via munmap.
+//!
+//! ## Thread Safety
+//!
+//! All operations are lock-free using atomic compare-and-swap.
+//! Multiple threads can allocate concurrently without blocking.
+//!
+//! ## Usage
+//!
+//! ```zig
+//! const allocator = internal_alloc.global();
+//! const arena = try allocator.create(Arena);
+//! ```
+
 const std = @import("std");
 const assert = @import("util.zig").assert;
 const types = @import("types.zig");

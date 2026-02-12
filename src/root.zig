@@ -1,3 +1,57 @@
+//! # zmemalloc - High-Performance Memory Allocator
+//!
+//! A mimalloc-inspired memory allocator optimized for multi-threaded workloads.
+//!
+//! ## Architecture Overview
+//!
+//! ```
+//! Thread 1                    Thread 2                    OS Memory
+//! ┌─────────┐                ┌─────────┐                 ┌─────────┐
+//! │  Heap   │                │  Heap   │                 │  Arena  │
+//! │┌───────┐│                │┌───────┐│                 │(32MB    │
+//! ││ Bins  ││                ││ Bins  ││                 │ blocks) │
+//! │└───────┘│                │└───────┘│                 └────┬────┘
+//! └────┬────┘                └────┬────┘                      │
+//!      │                          │                           │
+//!      ▼                          ▼                           │
+//! ┌─────────┐                ┌─────────┐                      │
+//! │Segments │                │Segments │◄─────────────────────┘
+//! │(32MB)   │                │(32MB)   │
+//! │┌───────┐│                │┌───────┐│
+//! ││ Pages ││                ││ Pages ││
+//! ││64KB/  ││                ││64KB/  ││
+//! ││512KB  ││                ││512KB  ││
+//! │└───────┘│                │└───────┘│
+//! └─────────┘                └─────────┘
+//! ```
+//!
+//! ## Key Concepts
+//!
+//! - **Heap**: Per-thread structure with bin queues for size classes
+//! - **Segment**: 32MB memory region containing multiple pages
+//! - **Page**: Fixed-size region (64KB/512KB) containing same-size blocks
+//! - **Block**: User allocation unit, stored in free lists when not in use
+//! - **Arena**: OS memory pool for segment allocation (optional)
+//!
+//! ## Allocation Flow
+//!
+//! 1. **Fast Path** (`mallocSmallFast`): Direct page lookup + free list pop
+//! 2. **Medium Path** (`mallocMedium`): Bin queue lookup
+//! 3. **Slow Path** (`mallocGeneric`): Segment allocation, page initialization
+//!
+//! ## Cross-Thread Free Handling
+//!
+//! When thread B frees memory allocated by thread A:
+//! 1. Block is added to page's atomic `xthread_free` list
+//! 2. Thread A collects `xthread_free` during allocation
+//! 3. `reclaimFullPages()` scans full pages for pending cross-thread frees
+//!
+//! ## Memory Return to OS
+//!
+//! - Empty pages are freed back to segments
+//! - Empty segments are freed back to arenas
+//! - Arena purge (`tryPurge`) decommits freed blocks via MADV_DONTNEED
+
 const std = @import("std");
 const builtin = @import("builtin");
 const assert = @import("util.zig").assert;
@@ -18,35 +72,71 @@ const Segment = segment_mod.Segment;
 const TLD = tld_mod.TLD;
 const SegmentAbandonedQueue = segment_mod.SegmentAbandonedQueue;
 
-const MAX_SCAN_PAGES = 8;
-const COLLECT_INTERVAL: usize = 512;
-const ABANDON_RECLAIM_LIMIT: usize = 16; // Max segments to reclaim per allocation
-const SEGMENT_HIGH_WATERMARK: usize = 128; // Trigger reduction when segment count exceeds this
-const PURGE_DELAY_MS: i64 = 100; // Delay before purging freed pages
-
 // =============================================================================
-// Global State (Process-wide)
+// Configuration Constants
 // =============================================================================
 
-/// Global subproc for abandoned segments management
+/// Max segments to reclaim from abandoned queue per allocation attempt
+const ABANDON_RECLAIM_LIMIT: usize = 16;
+
+/// Trigger aggressive memory reduction when segment count exceeds this
+const SEGMENT_HIGH_WATERMARK: usize = 16;
+
+/// Delay before purging freed pages to OS (milliseconds)
+/// Prevents thrashing when memory is freed and reallocated quickly
+const PURGE_DELAY_MS: i64 = 100;
+
+/// Trigger full page scan when this many cross-thread frees are pending
+/// Higher = less scanning overhead, but more memory retention
+const XTHREAD_COLLECT_THRESHOLD: usize = 1024;
+
+// =============================================================================
+// Global State (Process-wide, shared across all threads)
+// =============================================================================
+
+/// Manages abandoned segments from exited threads
+/// Other threads can reclaim these segments instead of allocating new ones
 var global_subproc: Subproc = .{};
 
-/// Count of active threads using the allocator
+/// Number of threads currently using the allocator
+/// Used for debugging and statistics
 var active_thread_count: Atomic(usize) = .init(0);
+
+// Debug counters
+// pub var dbg_fast_success: usize = 0;
+// pub var dbg_fast_no_page: usize = 0;
+// pub var dbg_fast_exhausted: usize = 0;
+// pub var dbg_cold_path_calls: usize = 0;
+// pub var dbg_page_readded: usize = 0;
 
 // =============================================================================
 // Thread-Local State
 // =============================================================================
 
+/// Thread-local data for this thread's allocator state
 threadlocal var tld: TLD = .{};
+
+/// Whether TLD has been initialized for this thread
 threadlocal var tld_initialized: bool = false;
-// Direct heap pointer — also serves as init sentinel (null = not initialized)
+
+/// Cached heap pointer for fast access (also serves as init sentinel)
 threadlocal var cached_heap: ?*Heap = null;
-/// Cached thread ID for fast comparison in free path
+
+/// Cached thread ID (TLD address) for fast same-thread check in free()
 threadlocal var cached_thread_id: usize = 0;
-/// Last purge check timestamp (for time-based purge delay)
+
+/// Timestamp of last purge check (prevents frequent syscalls)
 threadlocal var last_purge_check: i64 = 0;
 
+/// Allocation counter for periodic maintenance tasks
+threadlocal var alloc_count: usize = 0;
+
+// =============================================================================
+// Thread-Local Initialization
+// =============================================================================
+
+/// Ensure TLD is initialized, return pointer to it
+/// Used by functions that need TLD but may be called before first allocation
 inline fn ensureTldInitialized() *TLD {
     if (cached_heap == null) {
         @branchHint(.unlikely);
@@ -55,13 +145,15 @@ inline fn ensureTldInitialized() *TLD {
     return &tld;
 }
 
-/// Get heap for fast path or initialize TLD — single threadlocal read
+/// Get heap pointer, initializing TLD if needed
+/// This is the entry point for all allocations - single threadlocal read
 inline fn getHeapOrInit() *Heap {
     if (cached_heap) |h| return h;
     return initHeapSlow();
 }
 
-/// Cold path for heap initialization - NOT inline to keep malloc hot path small
+/// Initialize thread-local state (cold path)
+/// Marked noinline to keep malloc hot path small and avoid register pressure
 noinline fn initHeapSlow() *Heap {
     initTld(&tld);
     tld_initialized = true;
@@ -70,108 +162,246 @@ noinline fn initHeapSlow() *Heap {
     return cached_heap.?;
 }
 
-/// Initialize TLD - NOT inline to avoid AVX register pollution in malloc hot path
-/// This prevents vzeroupper from being needed in malloc's epilogue
+/// Set up TLD structure for this thread
+/// Uses TLD address as thread ID (faster than syscall, unique per thread)
 inline fn initTld(t: *TLD) void {
     std.mem.doNotOptimizeAway(t);
-    // Use TLD address as thread ID - fast, no syscall
     const thread_id = @intFromPtr(t);
-    cached_thread_id = thread_id; // Cache for fast free path
+    cached_thread_id = thread_id;
 
     t.segments = segment_mod.SegmentsTLD.init(t.os_allocator.allocator());
     t.segments.subproc = &global_subproc;
-    t.segments.thread_id = thread_id; // For segment creation
+    t.segments.thread_id = thread_id;
+    t.segments.heap = &heap_mod.heap_main;
     t.heap_backing = &heap_mod.heap_main;
     heap_mod.heap_main.tld = t;
     heap_mod.heap_main.thread_id = thread_id;
 }
 
-/// Fast path for small allocations (inlined, minimal ops)
-/// Only does direct page lookup + free list pop — no bin queue scanning.
+// =============================================================================
+// Allocation Paths (Hot -> Cold)
+// =============================================================================
+
+/// **Fast Path**: Direct page lookup for small allocations (< 1KB)
+///
+/// Uses `pages_free_direct[wsize]` array for O(1) lookup without bin scanning.
+/// This is the hottest allocation path - just two pointer dereferences.
+///
+/// Flow: wsize -> direct page -> pop from free list -> return
+///
+/// Returns: Block pointer or null (fallback to mallocMedium)
 inline fn mallocSmallFast(heap: *Heap, size: usize) ?[*]u8 {
     const wsize = (size + types.INTPTR_SIZE - 1) / types.INTPTR_SIZE;
     const page = heap.pages_free_direct[wsize] orelse {
         @branchHint(.unlikely);
+        // dbg_fast_no_page += 1;
         return null;
     };
 
     if (page.popFreeBlock()) |block| {
         @branchHint(.likely);
+        // dbg_fast_success += 1;
         return @ptrCast(block);
     }
 
-    // Direct page exhausted — clear it so we don't retry next time.
-    // mallocMedium will find a page via the bin queue.
+    // Direct page exhausted - mark as full and remove from bin queue
+    // This prevents mallocMedium from trying the same exhausted page
+    // dbg_fast_exhausted += 1;
+    const bin = page_mod.binFromSize(size);
+    page.set_in_full(true);
+    page.pageRemoveFromBin(heap, bin);
     heap.pages_free_direct[wsize] = null;
     return null;
 }
 
-/// Medium allocation path — bin queue lookup
+/// Allocate from a specific page, handling exhaustion and cross-thread frees
+///
+/// This function:
+/// 1. Pops a block from the page's free list
+/// 2. Updates direct pointer cache for fast path
+/// 3. Collects cross-thread frees if page appears exhausted
+/// 4. Marks page as "full" if truly exhausted
+///
+/// Returns: Block pointer or null if page is completely exhausted
+inline fn tryAllocFromPage(heap: *Heap, pg: *Page, bin: usize) ?[*]u8 {
+    // Try direct pop first
+    if (pg.popFreeBlock()) |block| {
+        @branchHint(.likely);
+        setDirectPointerForBlockSize(heap, pg);
+        if (!pg.hasFreeQuick()) {
+            @branchHint(.unlikely);
+            handlePageExhausted(heap, pg, bin);
+        }
+        return @ptrCast(block);
+    }
+
+    // Page appears empty - collect xthread_free and retry
+    if (pg.xthread_free.load(.monotonic) != null) {
+        _ = pg.collectXthreadFree();
+        if (pg.popFreeBlock()) |block| {
+            setDirectPointerForBlockSize(heap, pg);
+            if (!pg.hasFree()) {
+                handlePageExhausted(heap, pg, bin);
+            }
+            return @ptrCast(block);
+        }
+    }
+
+    // Truly exhausted
+    handlePageExhausted(heap, pg, bin);
+    return null;
+}
+
+/// Handle page exhaustion: collect xthread_free and mark as full if needed
+///
+/// Called when a page appears to have no free blocks. Before marking it "full",
+/// we try to collect cross-thread frees which might provide more blocks.
+///
+/// A page marked "full" is removed from bin queue to prevent allocation attempts.
+/// It will be reclaimed when cross-thread frees are collected via `reclaimFullPages`.
+inline fn handlePageExhausted(heap: *Heap, pg: *Page, bin: usize) void {
+    // Last chance: collect xthread_free before marking full
+    if (pg.xthread_free.load(.monotonic) != null) {
+        _ = pg.collectXthreadFree();
+    }
+    if (!pg.hasFree()) {
+        pg.pageRemoveFromBin(heap, bin);
+        pg.set_in_full(true);
+        clearDirectPointersForPage(heap, pg);
+    }
+}
+
+/// **Medium Path**: Bin queue lookup for all size classes
+///
+/// Each size class has a bin queue (linked list of pages).
+/// Pages are added to bins when they have free blocks.
+///
+/// If the bin is empty, triggers `reclaimFullPages` to collect cross-thread
+/// frees from "full" pages that may now have available blocks.
+///
+/// Flow: size -> bin index -> page queue -> tryAllocFromPage
+///
+/// Returns: Block pointer or null (fallback to mallocGeneric)
 inline fn mallocMedium(heap: *Heap, size: usize) ?[*]u8 {
     const bin = page_mod.binFromSize(size);
     const pq = &heap.pages[bin];
 
+    // Try current bin queue page
     if (pq.tail) |pg| {
         @branchHint(.likely);
-        if (pg.popFreeBlock()) |block| {
-            @branchHint(.likely);
-            // Update direct pointer so next small alloc skips bin lookup
-            setDirectPointerForBlockSize(heap, pg);
+        if (tryAllocFromPage(heap, pg, bin)) |ptr| {
+            return ptr;
+        }
+    }
 
-            // Quick check: is page exhausted? (skip atomic xthread load)
-            if (!pg.hasFreeQuick()) {
-                @branchHint(.unlikely);
-                pg.pageRemoveFromBin(heap, bin);
-                pg.set_in_full(true);
-                clearDirectPointersForPage(heap, pg);
+    // Bin empty - reclaim full pages with pending xthread_free
+    if (page_mod.pending_xthread_free.load(.monotonic) > 0) {
+        @branchHint(.unlikely);
+        if (heap.tld) |t| {
+            _ = reclaimFullPages(t, heap);
+            if (pq.tail) |pg| {
+                return tryAllocFromPage(heap, pg, bin);
             }
-            return @ptrCast(block);
-        } else {
-            @branchHint(.unlikely);
-            // Page fully exhausted (free list empty, bump done, xthread collected).
-            // Remove from bin so mallocGeneric doesn't retry the same page.
-            pg.pageRemoveFromBin(heap, bin);
-            pg.set_in_full(true);
-            clearDirectPointersForPage(heap, pg);
         }
     }
 
     return null;
 }
 
-/// Set pages_free_direct for the block_size's wsize
-/// The bin queue (via mallocMedium) handles other wsizes in the same bin
+/// Update direct pointer cache after successful allocation
+///
+/// The `pages_free_direct` array provides O(1) lookup for small sizes.
+/// When we allocate from a page, we cache it for that exact wsize
+/// so the next allocation of the same size can skip bin lookup.
+///
+/// IMPORTANT: We set pointers for ALL wsizes that map to this page's bin,
+/// not just the block_wsize. This ensures fast path works for any size
+/// that could use this page.
 inline fn setDirectPointerForBlockSize(heap: *Heap, page: *Page) void {
     if (page.block_size == 0) return;
 
     const block_wsize = (page.block_size + types.INTPTR_SIZE - 1) / types.INTPTR_SIZE;
-    if (block_wsize <= types.SMALL_WSIZE_MAX) {
-        heap.pages_free_direct[block_wsize] = page;
+    if (block_wsize > types.SMALL_WSIZE_MAX) return;
+
+    // For small bins (<=8), wsize maps 1:1 to bin
+    // For larger bins, multiple wsizes map to same bin
+    // Set direct pointer for the block_wsize (handles exact match)
+    heap.pages_free_direct[block_wsize] = page;
+
+    // Also set for wsizes that round up to this block_size
+    // The bin uses block_size which is the MAX for that bin
+    // Any wsize where binFromWsize(wsize) == binFromWsize(block_wsize) can use this page
+    const bin = page_mod.binFromWsize(block_wsize);
+    if (bin <= 8) return; // For bins 1-8, wsize == bin == block_wsize, already handled
+
+    // For larger bins, find the minimum wsize that maps to this bin
+    // and set direct pointers for the range [min_wsize, block_wsize]
+    var wsize: usize = block_wsize;
+    while (wsize > 8 and page_mod.binFromWsize(wsize - 1) == bin) {
+        wsize -= 1;
+    }
+    // Set pointers for all wsizes in this bin
+    while (wsize <= block_wsize) : (wsize += 1) {
+        if (wsize <= types.SMALL_WSIZE_MAX) {
+            heap.pages_free_direct[wsize] = page;
+        }
     }
 }
 
-/// Try purge expired pages if enough time has passed (time-based purge delay)
-/// Called during allocation when memory pressure is high
+// =============================================================================
+// Memory Maintenance (Background Tasks)
+// =============================================================================
+
+/// Periodic memory return to OS
+///
+/// Called during allocation to release unused memory back to the OS.
+/// Uses time-based throttling to avoid syscall overhead.
+///
+/// Tasks performed:
+/// 1. Free empty segments
+/// 2. Decommit freed arena blocks (MADV_DONTNEED)
+/// 3. Aggressive reduction if over high watermark
 inline fn tryPurgeDelayed() void {
     if (!tld_initialized) return;
 
     const now = std.time.milliTimestamp();
-    // Only check every PURGE_DELAY_MS to avoid frequent syscalls
     if (now - last_purge_check < PURGE_DELAY_MS) return;
     last_purge_check = now;
 
-    // Purge expired pages in segments
+    // Free empty segments
     _ = tld.segments.collect(false);
 
-    // If still over high watermark, reduce more aggressively
+    // Decommit freed arena blocks
+    const arena_mod = @import("arena.zig");
+    arena_mod.globalArenas().tryPurge(false);
+
+    // Aggressive reduction if holding too many segments
     if (tld.segments.count > SEGMENT_HIGH_WATERMARK) {
         _ = tld.segments.reduceMemory(SEGMENT_HIGH_WATERMARK / 2);
     }
 }
 
-/// Generic allocation - slow path when fast path fails
+/// **Slow Path**: Full allocation logic when fast/medium paths fail
+///
+/// This handles:
+/// 1. Cross-thread free collection when threshold exceeded
+/// 2. Page allocation from segments
+/// 3. Segment reclamation from abandoned queue
+/// 4. Page initialization for fresh pages
+/// 5. Zero-fill for calloc/zalloc
+///
+/// This is the most expensive path but handles all edge cases.
 inline fn mallocGeneric(heap: *Heap, size: usize, zero: bool) ?[*]u8 {
     const t = heap.tld orelse return null;
+
+    // Collect cross-thread frees when too many are pending
+    // This prevents memory from being "stuck" in full pages
+    const pending = page_mod.pending_xthread_free.load(.monotonic);
+    if (pending > XTHREAD_COLLECT_THRESHOLD) {
+        @branchHint(.unlikely);
+        _ = t.segments.collectAllXthreadFree();
+        _ = reclaimFullPages(t, heap);
+    }
 
     // Round up to bin's block size - this allows page reuse across similar sizes
     const bin = page_mod.binFromSize(size);
@@ -182,38 +412,27 @@ inline fn mallocGeneric(heap: *Heap, size: usize, zero: bool) ?[*]u8 {
     else
         page_mod.blockSizeForBin(bin);
 
-    // Check bin queue first for all sizes (including large)
-    // This allows page reuse for sizes > MEDIUM_OBJ_SIZE_MAX
+    // Check bin queue first
     if (bin < heap.pages.len) {
         const pq = &heap.pages[bin];
         if (pq.tail) |pg| {
-            // For huge allocations, we must verify the page's block_size matches
-            // since all huge sizes map to BIN_HUGE regardless of actual size
             if (pg.block_size >= block_size) {
                 if (pg.popFreeBlock()) |block| {
                     @branchHint(.likely);
                     if (!pg.hasFree()) {
-                        @branchHint(.unlikely);
+                        @setEvalBranchQuota(10_000);
                         pg.pageRemoveFromBin(heap, bin);
                         pg.set_in_full(true);
                         clearDirectPointersForPage(heap, pg);
                     }
                     const ptr: [*]u8 = @ptrCast(block);
                     if (zero) {
-                        @branchHint(.cold);
                         @memset(ptr[0..block_size], 0);
                     }
                     return ptr;
                 }
             }
         }
-    }
-
-    // Before allocating new pages, try purging expired ones (time-based)
-    // This is the "idle" point where we can afford cleanup
-    if (t.segments.count > SEGMENT_HIGH_WATERMARK / 2) {
-        @branchHint(.cold);
-        tryPurgeDelayed();
     }
 
     // Try to get a page, reclaim abandoned segments if needed
@@ -231,15 +450,13 @@ inline fn mallocGeneric(heap: *Heap, size: usize, zero: bool) ?[*]u8 {
         return null;
     };
 
-    @prefetch(pg, .{ .cache = .data, .locality = 3, .rw = .read });
-
     // Initialize page if not yet initialized (page_start is null)
     if (pg.page_start == null) {
         @branchHint(.cold);
-        const segment = Segment.fromPtr(pg);
-        assert(@intFromPtr(segment) % types.SEGMENT_SIZE == 0);
+        const s = Segment.fromPtr(pg);
+        assert(@intFromPtr(s) % types.SEGMENT_SIZE == 0);
         var page_size: usize = undefined;
-        const page_start = segment.pageStart(pg, &page_size);
+        const page_start = s.pageStart(pg, &page_size);
         pg.init(block_size, page_start, page_size);
     }
 
@@ -269,6 +486,7 @@ inline fn mallocGeneric(heap: *Heap, size: usize, zero: bool) ?[*]u8 {
         pg.set_in_full(false);
         pg.pagePushBin(heap, bin);
     }
+
     // Update direct pointer for the block_size's wsize
     // Other wsizes in the bin will use mallocMedium's bin queue lookup
     setDirectPointerForBlockSize(heap, pg);
@@ -281,46 +499,159 @@ inline fn clearDirectPointersForPage(heap: *Heap, page: *Page) void {
     if (page.block_size == 0) return;
 
     const block_wsize = (page.block_size + types.INTPTR_SIZE - 1) / types.INTPTR_SIZE;
-    if (block_wsize <= types.SMALL_WSIZE_MAX) {
-        if (heap.pages_free_direct[block_wsize] == page) {
-            heap.pages_free_direct[block_wsize] = null;
+    if (block_wsize > types.SMALL_WSIZE_MAX) return;
+
+    // Clear for block_wsize
+    if (heap.pages_free_direct[block_wsize] == page) {
+        heap.pages_free_direct[block_wsize] = null;
+    }
+
+    // For larger bins, also clear all wsizes that map to this bin
+    const bin = page_mod.binFromWsize(block_wsize);
+    if (bin <= 8) return;
+
+    var wsize: usize = block_wsize;
+    while (wsize > 8 and page_mod.binFromWsize(wsize - 1) == bin) {
+        wsize -= 1;
+    }
+    while (wsize <= block_wsize) : (wsize += 1) {
+        if (wsize <= types.SMALL_WSIZE_MAX and heap.pages_free_direct[wsize] == page) {
+            heap.pages_free_direct[wsize] = null;
         }
     }
 }
 
-/// Get fast thread ID - cached for minimal overhead in free path
+/// Get cached thread ID for fast same-thread check
 inline fn fastThreadId() usize {
     return cached_thread_id;
 }
 
-/// Cold path for free - handle full page becoming non-full
-inline fn freeColdPath(page: *Page) void {
-    page.set_in_full(false);
+// =============================================================================
+// Cross-Thread Free Handling
+// =============================================================================
+
+/// Reclaim pages with pending cross-thread frees
+///
+/// **Critical for cross-thread workloads** (e.g., producer-consumer patterns)
+///
+/// When thread B frees memory allocated by thread A:
+/// 1. Block goes to page's `xthread_free` atomic list
+/// 2. Page may be marked "full" (not in bin queue)
+/// 3. Thread A can't allocate from it (not visible)
+/// 4. This function scans ALL pages to find and reclaim them
+///
+/// For each page, this function:
+/// - Collects pending xthread_free blocks
+/// - Frees completely empty pages back to segment
+/// - Re-adds non-empty pages to bin queue
+///
+/// Returns: Number of pages reclaimed/reactivated
+inline fn reclaimFullPages(t: *TLD, heap: *Heap) usize {
+    var reclaimed: usize = 0;
+
+    // Scan all segments owned by this thread
+    var segment = t.segments.all_segments.tail;
+    while (segment) |seg| {
+        const next = seg.all_prev;
+        for (0..seg.capacity) |i| {
+            const pg = &seg.pages[i];
+            if (pg.is_segment_in_use()) {
+                // Collect cross-thread frees
+                if (pg.xthread_free.load(.monotonic) != null) {
+                    _ = pg.collectXthreadFree();
+                }
+
+                // Free empty pages
+                if (pg.used == 0 and pg.capacity > 0) {
+                    if (pg.is_in_bin()) {
+                        const bin = page_mod.binFromSize(pg.block_size);
+                        pg.pageRemoveFromBin(heap, bin);
+                    }
+                    clearDirectPointersForPage(heap, pg);
+                    pg.set_in_full(false);
+                    t.segments.freePage(pg, false);
+                    reclaimed += 1;
+                } else if (pg.is_in_full() and pg.hasFree()) {
+                    // Reactivate full page that now has space
+                    pg.set_in_full(false);
+                    const bin = page_mod.binFromSize(pg.block_size);
+                    if (bin < heap.pages.len and !pg.is_in_bin()) {
+                        pg.pagePushBin(heap, bin);
+                    }
+                    reclaimed += 1;
+                }
+            }
+        }
+        segment = next;
+    }
+    return reclaimed;
+}
+
+// =============================================================================
+// Free Path
+// =============================================================================
+
+/// Cold path for free: handle page state transitions
+///
+/// Called when freeing to a page that was marked "full".
+/// Either frees the page (if now empty) or reactivates it in the bin queue.
+noinline fn freeColdPath(page: *Page) void {
+    // dbg_cold_path_calls += 1;
     const heap = &heap_mod.heap_main;
     const bin = page_mod.binFromSize(page.block_size);
-    if (bin < heap.pages.len) {
+
+    // Page is now completely empty - return to segment
+    if (page.used == 0 and page.capacity > 0) {
+        page.set_in_full(false);
+        if (page.is_in_bin()) {
+            page.pageRemoveFromBin(heap, bin);
+        }
+        clearDirectPointersForPage(heap, page);
+        _ = ensureTldInitialized();
+        tld.segments.freePage(page, false);
+        return;
+    }
+
+    // Page has space now - add back to bin queue for allocation
+    page.set_in_full(false);
+    if (bin < heap.pages.len and !page.is_in_bin()) {
+        // dbg_page_readded += 1;
         page.pagePushBin(heap, bin);
         setDirectPointerForBlockSize(heap, page);
     }
 }
 
-/// Free memory - minimal hot path
+/// Free memory to the allocator
+///
+/// **Hot Path** (same-thread free):
+/// 1. Lookup segment from pointer (bit masking)
+/// 2. Lookup page within segment
+/// 3. Push block to page's local_free list
+/// 4. Handle full page transition if needed
+///
+/// **Cross-Thread Path**:
+/// Block is added to page's atomic xthread_free list.
+/// The owning thread will collect it during allocation.
+///
+/// **Abandoned Path**:
+/// If owning thread has exited, treat as same-thread free.
 inline fn freeImpl(ptr: ?*anyopaque) void {
     const p = ptr orelse return;
 
-    // Single segment lookup
+    // Find segment and page for this pointer
     const segment = Segment.fromPtr(p);
     const page = Segment.pageFromPtrWithSegment(segment, p);
     const block: *Block = @ptrCast(@alignCast(p));
 
-    // Fast thread check
+    // Check if this is same-thread free (hot path)
     const page_thread = segment.thread_id.load(.monotonic);
 
     if (page_thread == fastThreadId()) {
         @branchHint(.likely);
-        // Hot path: just push to free list
+        // Same thread: direct push to local free list
         page.pushFreeBlock(block);
-        // Cold path: handle full page transition
+
+        // Handle full -> non-full transition
         if (page.is_in_full()) {
             @branchHint(.unlikely);
             freeColdPath(page);
@@ -330,7 +661,9 @@ inline fn freeImpl(ptr: ?*anyopaque) void {
         page.pushFreeBlock(block);
     } else {
         @branchHint(.unlikely);
-        // Different thread - use cross-thread free
+        // Cross-thread free: use xthread_free
+        // Note: delayed_free approach has thread-lifetime issues (crash when owner thread exits)
+        // TODO: implement safe delayed_free with reference counting or hazard pointers
         page.xthreadFree(block);
     }
 }
@@ -424,39 +757,53 @@ pub const ZMemAllocator = struct {
 /// Maximum size for fast path (fits in direct page lookup)
 const MAX_FAST_SIZE: usize = types.SMALL_WSIZE_MAX * types.INTPTR_SIZE;
 
-/// Allocate memory
-pub fn malloc(size: usize) ?[*]u8 {
-    if (size == 0) {
-        @branchHint(.cold);
-        return null;
+/// Periodic maintenance - isolated to prevent AVX contamination of malloc hot path
+noinline fn doPeriodicMaintenance(heap: *Heap) void {
+    const pending = page_mod.pending_xthread_free.load(.monotonic);
+    if (pending > 64) {
+        if (heap.tld) |t| {
+            _ = reclaimFullPages(t, heap);
+        }
     }
+    tryPurgeDelayed();
+}
+
+/// Slow path when fast allocation fails - noinline to reduce register pressure in malloc
+noinline fn mallocSlowPath(heap: *Heap, size: usize) ?[*]u8 {
+    // Try medium path first (bin queue lookup)
+    if (size <= types.MEDIUM_OBJ_SIZE_MAX) {
+        if (mallocMedium(heap, size)) |ptr| {
+            return ptr;
+        }
+    }
+    // Fall back to generic allocation
+    return mallocGeneric(heap, size, false);
+}
+
+/// Allocate memory - optimized for small allocation fast path
+pub fn malloc(size: usize) ?[*]u8 {
+    if (size == 0) return null;
 
     // Single threadlocal read — also initializes TLD on first call
     const heap = getHeapOrInit();
 
-    // Fast path for small allocations
+    // Periodic maintenance every 256 allocations
+    alloc_count +%= 1;
+    if (alloc_count & 0xFF == 0) {
+        @branchHint(.unlikely);
+        doPeriodicMaintenance(heap);
+    }
+
+    // Fast path: direct page lookup for small sizes (< 1KB)
     if (size <= MAX_FAST_SIZE) {
         @branchHint(.likely);
         if (mallocSmallFast(heap, size)) |ptr| {
-            @branchHint(.likely);
-            return ptr;
-        }
-        if (mallocMedium(heap, size)) |ptr| {
-            @branchHint(.likely);
-            return ptr;
-        }
-        return mallocGeneric(heap, size, false);
-    }
-
-    // Medium/large path
-    if (size <= types.MEDIUM_OBJ_SIZE_MAX) {
-        @branchHint(.likely);
-        if (mallocMedium(heap, size)) |ptr| {
             return ptr;
         }
     }
 
-    return mallocGeneric(heap, size, false);
+    // Slow path: medium/large allocations or when fast path exhausted
+    return mallocSlowPath(heap, size);
 }
 
 /// Allocate zeroed memory
@@ -542,45 +889,43 @@ pub fn collect(force: bool) usize {
     if (!tld_initialized) return 0;
 
     var collected: usize = 0;
+    const heap = &heap_mod.heap_main;
 
-    // Collect unused memory from segments
+    // First, collect xthread_free from ALL pages in ALL segments (including full ones)
+    // This updates page.used counts for cross-thread freed blocks
+    collected += tld.segments.collectAllXthreadFree();
+
+    // Now iterate ALL segments and free empty pages
+    // This handles pages that were in_full but became empty after xthread_free collection
+    var segment = tld.segments.all_segments.tail;
+    while (segment) |seg| {
+        const next_seg = seg.all_prev;
+        var pages_freed: usize = 0;
+
+        for (0..seg.capacity) |i| {
+            const pg = &seg.pages[i];
+            if (pg.is_segment_in_use() and pg.used == 0 and pg.capacity > 0) {
+                // Page is empty - free it
+                if (pg.is_in_bin()) {
+                    const bin = page_mod.binFromSize(pg.block_size);
+                    pg.pageRemoveFromBin(heap, bin);
+                }
+                clearDirectPointersForPage(heap, pg);
+                pg.set_in_full(false);
+                tld.segments.freePage(pg, force);
+                pages_freed += 1;
+            }
+        }
+        collected += pages_freed;
+        segment = next_seg;
+    }
+
+    // Collect unused memory from segments (free empty segments)
     collected += tld.segments.collect(force);
 
-    // Clean up heap's page queues - retire empty pages
-    const heap = &heap_mod.heap_main;
-    for (&heap.pages, 0..) |*pq, bin| {
-        var page = pq.tail;
-        while (page) |pg| {
-            const next = pg.prev;
-            // Retire empty pages (no delay - simplifies logic)
-            if (pg.used == 0 and pg.capacity > 0) {
-                pg.pageRemoveFromBin(heap, bin);
-                clearDirectPointersForPage(heap, pg);
-                tld.segments.freePage(pg, force);
-                collected += 1;
-            }
-            page = next;
-        }
-    }
-
-    // Handle empty pages from direct pointers (might not be in queue)
-    // Note: We iterate a copy to avoid issues during clearing
-    var pages_to_check: [types.PAGES_DIRECT]?*Page = undefined;
-    inline for (&heap.pages_free_direct, 0..) |direct, i| {
-        @setEvalBranchQuota(10_0000);
-        pages_to_check[i] = direct;
-    }
-
-    for (pages_to_check) |maybe_pg| {
-        const pg = maybe_pg orelse continue;
-        if (pg.used == 0 and pg.capacity > 0) {
-            clearDirectPointersForPage(heap, pg);
-            const bin = page_mod.binFromSize(pg.block_size);
-            pg.pageRemoveFromBin(heap, bin);
-            tld.segments.freePage(pg, force);
-            collected += 1;
-        }
-    }
+    // Purge freed arena blocks (return memory to OS)
+    const arena_mod = @import("arena.zig");
+    arena_mod.globalArenas().tryPurge(force);
 
     return collected;
 }
@@ -680,8 +1025,10 @@ pub fn reclaimAbandoned(max_count: usize) usize {
             _ = global_subproc.abandoned_os_list_count.fetchSub(1, .monotonic);
             _ = global_subproc.abandoned_count.fetchSub(1, .monotonic);
 
-            // Add to our free queue
+            // Add to our segment lists
             seg.?.was_reclaimed = true;
+            seg.?.heap.store(&heap_mod.heap_main, .release); // Update heap pointer to new owner
+            tld.segments.all_segments.push(seg.?);
             tld.segments.insertInFreeQueue(seg.?);
             tld.segments.reclaim_count += 1;
 
@@ -1606,16 +1953,16 @@ test "data race: stress test with many threads" {
     }
 
     const err_count = errors.load(.seq_cst);
-    const alloc_count = total_allocs.load(.seq_cst);
+    const alloc_c = total_allocs.load(.seq_cst);
     const free_count = total_frees.load(.seq_cst);
 
     std.debug.print("\n=== Data Race Stress Test Results ===\n", .{});
     std.debug.print("Threads: {}, Ops/thread: {}\n", .{ num_threads, ops_per_thread });
-    std.debug.print("Total allocs: {}, Total frees: {}\n", .{ alloc_count, free_count });
+    std.debug.print("Total allocs: {}, Total frees: {}\n", .{ alloc_c, free_count });
     std.debug.print("Errors: {}\n\n", .{err_count});
 
     try std.testing.expectEqual(@as(usize, 0), err_count);
-    try std.testing.expectEqual(alloc_count, free_count);
+    try std.testing.expectEqual(alloc_c, free_count);
 }
 
 test "data race: rapid alloc-free ping-pong" {
@@ -2837,4 +3184,168 @@ test "huge allocation: realloc from small to huge" {
     try std.testing.expectEqual(@as(u8, 0xAA), ptr[10 * types.MiB]);
 
     free_mem(ptr);
+}
+
+test "xmalloc-testN pattern: asymmetric alloc/free threads" {
+    // Simulates the xmalloc-testN benchmark pattern:
+    // Some threads only allocate, others only free (cross-thread)
+    const num_alloc_threads = 4;
+    const num_free_threads = 4;
+    const allocs_per_thread = 5000;
+    const block_size = 64;
+
+    // Shared queue of pointers for cross-thread free
+    const queue_size = 4096;
+    var queue: [queue_size]std.atomic.Value(?[*]u8) = undefined;
+    for (&queue) |*p| {
+        p.* = std.atomic.Value(?[*]u8).init(null);
+    }
+
+    var write_idx = std.atomic.Value(usize).init(0);
+    var read_idx = std.atomic.Value(usize).init(0);
+    var total_alloced = std.atomic.Value(usize).init(0);
+    var total_freed = std.atomic.Value(usize).init(0);
+    var alloc_done = std.atomic.Value(usize).init(0);
+    var errors = std.atomic.Value(usize).init(0);
+
+    const AllocThread = struct {
+        fn run(
+            q: []std.atomic.Value(?[*]u8),
+            w_idx: *std.atomic.Value(usize),
+            alloced: *std.atomic.Value(usize),
+            errs: *std.atomic.Value(usize),
+            a_done: *std.atomic.Value(usize),
+            thread_id: usize,
+        ) void {
+            std.debug.print("[Alloc T{}] Starting\n", .{thread_id});
+
+            var allocated: usize = 0;
+            for (0..allocs_per_thread) |i| {
+                const ptr = malloc(block_size) orelse {
+                    _ = errs.fetchAdd(1, .seq_cst);
+                    continue;
+                };
+
+                // Write pattern - use XOR to keep within byte range
+                const pattern: u8 = @truncate((thread_id ^ i) *% 17 +% 0x41);
+                @memset(ptr[0..block_size], pattern);
+
+                // Put in queue
+                const idx = w_idx.fetchAdd(1, .acq_rel) % queue_size;
+
+                // Wait for slot to be empty
+                var spins: usize = 0;
+                while (q[idx].load(.acquire) != null) {
+                    spins += 1;
+                    if (spins > 100_000) {
+                        // Queue full, free locally
+                        free_mem(ptr);
+                        allocated += 1;
+                        _ = alloced.fetchAdd(1, .seq_cst);
+                        continue;
+                    }
+                    std.atomic.spinLoopHint();
+                }
+
+                q[idx].store(ptr, .release);
+                allocated += 1;
+                _ = alloced.fetchAdd(1, .seq_cst);
+            }
+
+            _ = a_done.fetchAdd(1, .seq_cst);
+            std.debug.print("[Alloc T{}] Done, allocated {}\n", .{ thread_id, allocated });
+        }
+    };
+
+    const FreeThread = struct {
+        fn run(
+            q: []std.atomic.Value(?[*]u8),
+            r_idx: *std.atomic.Value(usize),
+            freed: *std.atomic.Value(usize),
+            errs: *std.atomic.Value(usize),
+            a_done: *std.atomic.Value(usize),
+            thread_id: usize,
+        ) void {
+            std.debug.print("[Free T{}] Starting\n", .{thread_id});
+
+            var freed_count: usize = 0;
+            var empty_spins: usize = 0;
+
+            while (true) {
+                const idx = r_idx.fetchAdd(1, .acq_rel) % queue_size;
+
+                if (q[idx].swap(null, .acq_rel)) |ptr| {
+                    // Verify pattern consistency - all bytes should be the same
+                    const first_byte = ptr[0];
+                    var pattern_ok = true;
+                    for (ptr[1..block_size]) |byte| {
+                        if (byte != first_byte) {
+                            pattern_ok = false;
+                            break;
+                        }
+                    }
+                    if (!pattern_ok) {
+                        std.debug.print("[Free T{}] Corrupted pattern detected\n", .{thread_id});
+                        _ = errs.fetchAdd(1, .seq_cst);
+                    }
+
+                    free_mem(ptr);
+                    freed_count += 1;
+                    _ = freed.fetchAdd(1, .seq_cst);
+                    empty_spins = 0;
+                } else {
+                    empty_spins += 1;
+                    if (empty_spins > 10000) {
+                        // Check if allocators are done
+                        if (a_done.load(.acquire) >= num_alloc_threads) {
+                            // One more pass to drain
+                            var found = false;
+                            for (q) |*p| {
+                                if (p.swap(null, .acq_rel)) |ptr| {
+                                    free_mem(ptr);
+                                    freed_count += 1;
+                                    _ = freed.fetchAdd(1, .seq_cst);
+                                    found = true;
+                                }
+                            }
+                            if (!found) break;
+                        }
+                        empty_spins = 0;
+                    }
+                    std.atomic.spinLoopHint();
+                }
+            }
+
+            std.debug.print("[Free T{}] Done, freed {}\n", .{ thread_id, freed_count });
+        }
+    };
+
+    std.debug.print("\n=== xmalloc-testN Pattern Test ===\n", .{});
+    std.debug.print("Alloc threads: {}, Free threads: {}, Allocs/thread: {}\n", .{ num_alloc_threads, num_free_threads, allocs_per_thread });
+
+    // Start threads
+    var alloc_threads: [num_alloc_threads]std.Thread = undefined;
+    var free_threads: [num_free_threads]std.Thread = undefined;
+
+    for (0..num_alloc_threads) |i| {
+        alloc_threads[i] = std.Thread.spawn(.{}, AllocThread.run, .{ &queue, &write_idx, &total_alloced, &errors, &alloc_done, i }) catch return;
+    }
+    for (0..num_free_threads) |i| {
+        free_threads[i] = std.Thread.spawn(.{}, FreeThread.run, .{ &queue, &read_idx, &total_freed, &errors, &alloc_done, i }) catch return;
+    }
+
+    // Wait for all
+    for (&alloc_threads) |*t| t.join();
+    for (&free_threads) |*t| t.join();
+
+    const total_a = total_alloced.load(.seq_cst);
+    const total_f = total_freed.load(.seq_cst);
+    const err_count = errors.load(.seq_cst);
+
+    std.debug.print("\n=== Results ===\n", .{});
+    std.debug.print("Total allocated: {}\n", .{total_a});
+    std.debug.print("Total freed: {}\n", .{total_f});
+    std.debug.print("Errors: {}\n", .{err_count});
+
+    try std.testing.expectEqual(@as(usize, 0), err_count);
 }

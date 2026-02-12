@@ -92,6 +92,16 @@ pub fn main() !void {
         break :blk timer.read();
     };
 
+    // std.debug.print("Fast success: {}, No page: {}, Exhausted: {}\n", .{
+    //     zmemalloc.dbg_fast_success,
+    //     zmemalloc.dbg_fast_no_page,
+    //     zmemalloc.dbg_fast_exhausted,
+    // });
+    // std.debug.print("Cold path: {}, Page readded: {}\n", .{
+    //     zmemalloc.dbg_cold_path_calls,
+    //     zmemalloc.dbg_page_readded,
+    // });
+
     // // smp_allocator
     const mimalloc_time = blk: {
         const smp = mimalloc.mimalloc_allocator;

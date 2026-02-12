@@ -1,3 +1,36 @@
+//! # OS Memory Allocator
+//!
+//! Zig `std.mem.Allocator` interface wrapping OS memory primitives.
+//! Used by the segment layer to obtain raw memory from the kernel.
+//!
+//! ## Memory Management
+//!
+//! - `map()`: Request memory from OS via mmap with alignment
+//! - `unmap()`: Return memory to OS via munmap
+//! - `realloc()`: Resize via mremap (Linux) or shrink via partial munmap
+//!
+//! ## Alignment Handling
+//!
+//! When alignment exceeds page size, we over-allocate and then
+//! unmap the excess regions at the beginning and end:
+//!
+//! ```
+//! Requested: [----aligned memory----]
+//! Allocated: [excess][----aligned memory----][excess]
+//!            ^unmap^                         ^unmap^
+//! ```
+//!
+//! ## Address Hint Management
+//!
+//! Maintains `std.heap.next_mmap_addr_hint` for address locality.
+//! Sequential allocations tend to be placed near each other,
+//! improving cache behavior and reducing TLB pressure.
+//!
+//! ## Platform Support
+//!
+//! - Linux: Uses mremap for efficient resizing
+//! - Other POSIX: Falls back to partial munmap for shrinking
+
 const std = @import("std");
 const builtin = @import("builtin");
 const mem = std.mem;
@@ -10,6 +43,10 @@ const page_size_min = os.mem_config_static.page_size;
 const utils = @import("util.zig");
 const assert = utils.assert;
 
+/// OS-backed memory allocator
+///
+/// Implements `std.mem.Allocator` using mmap/munmap/mremap.
+/// Each thread-local TLD has its own OsAllocator instance.
 pub const OsAllocator = @This();
 
 config: os.OsMemConfig,

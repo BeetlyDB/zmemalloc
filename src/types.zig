@@ -1,3 +1,41 @@
+//! # Core Type Definitions and Constants
+//!
+//! Compile-time constants defining the memory allocator layout and size classes.
+//! All values are tuned for efficient memory usage on 32-bit and 64-bit platforms.
+//!
+//! ## Memory Hierarchy (64-bit values)
+//!
+//! ```
+//! ┌────────────────────────────────────────────────────────────────┐
+//! │ Segment (32 MiB)                                               │
+//! │ ┌──────────┬──────────┬──────────┬─────┬──────────┐            │
+//! │ │ Slice 0  │ Slice 1  │ Slice 2  │ ... │ Slice 511│            │
+//! │ │ (64 KiB) │ (64 KiB) │ (64 KiB) │     │ (64 KiB) │            │
+//! │ └──────────┴──────────┴──────────┴─────┴──────────┘            │
+//! └────────────────────────────────────────────────────────────────┘
+//! ```
+//!
+//! ## Object Size Classes
+//!
+//! | Class  | Max Size | Page Type    | Description                    |
+//! |--------|----------|--------------|--------------------------------|
+//! | Small  | 8 KiB    | Small (64K)  | 8+ objects per page            |
+//! | Medium | 64 KiB   | Medium (512K)| 8+ objects per page            |
+//! | Large  | 16 MiB   | Multi-slice  | Dedicated page(s) per object   |
+//! | Huge   | > 16 MiB | Full segment | One object per segment         |
+//!
+//! ## Bin System
+//!
+//! - Bins 1-8: Exact word sizes (8, 16, 24, ... 64 bytes)
+//! - Bins 9+: Logarithmic spacing (96, 128, 192, 256, ...)
+//! - BIN_HUGE (73): Huge allocations marker
+//! - BIN_FULL (74): Full pages bin (pages with no free blocks)
+//!
+//! ## Commit Mask
+//!
+//! Each segment has a commit mask with one bit per slice (512 bits on 64-bit).
+//! This tracks which slices have been committed (backed by physical memory).
+
 const std = @import("std");
 const builtin = @import("builtin");
 
@@ -39,7 +77,7 @@ pub const MAX_ALIGN_SIZE: usize = @alignOf(std.c.max_align_t);
 // │ (64 KiB)  │ (64 KiB)  │ (64 KiB)  │     │ (64 KiB)                      │
 // └─────────────────────────────────────────────────────────────────────────┘
 //
-// =============================================================================
+// ============================================================================
 
 /// Slice shift: 16 on 64-bit (64 KiB), 15 on 32-bit (32 KiB)
 pub const SEGMENT_SLICE_SHIFT: usize = 13 + SIZE_SHIFT;

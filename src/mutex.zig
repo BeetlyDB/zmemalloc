@@ -1,3 +1,36 @@
+//! # Adaptive Mutex Implementation
+//!
+//! High-performance mutex using Linux futex with adaptive spinning.
+//! Optimized for low-contention scenarios common in memory allocators.
+//!
+//! ## Design
+//!
+//! Three states tracked in a single atomic u32:
+//! - `UNLOCKED` (0b00): Mutex is free
+//! - `LOCKED` (0b01): Mutex held, no waiters
+//! - `CONTENDED` (0b11): Mutex held, has waiters
+//!
+//! ## Fast Path
+//!
+//! Uses `lock bts` on x86 for single-instruction atomic test-and-set.
+//! If uncontended, lock/unlock is just two atomic operations.
+//!
+//! ## Slow Path
+//!
+//! On contention:
+//! 1. Spin briefly (50 iterations) with exponential backoff
+//! 2. If still contended, fall back to futex wait
+//! 3. Mark as CONTENDED so unlock will wake waiters
+//!
+//! ## Usage
+//!
+//! ```zig
+//! var mutex = Mutex{};
+//! mutex.lock();
+//! defer mutex.unlock();
+//! // critical section
+//! ```
+
 const std = @import("std");
 const builtin = @import("builtin");
 const Futex = std.Thread.Futex;

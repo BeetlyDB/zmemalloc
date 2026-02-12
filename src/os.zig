@@ -1,9 +1,42 @@
+//! # OS Interface Layer
+//!
+//! Low-level interface to operating system memory primitives.
+//! Provides portable abstractions over mmap, mprotect, and madvise.
+//!
+//! ## Memory Operations
+//!
+//! | Operation   | Syscall       | Effect                              |
+//! |-------------|---------------|-------------------------------------|
+//! | commit      | mprotect RW   | Make memory accessible              |
+//! | decommit    | MADV_DONTNEED | Release physical pages, keep VMA    |
+//! | reset       | MADV_FREE     | Mark pages as reusable (lazy free)  |
+//! | protect     | mprotect NONE | Make memory inaccessible (guard)    |
+//!
+//! ## Huge Pages (THP)
+//!
+//! Transparent Huge Pages can be enabled via `maybe_enable_thp()`.
+//! When `thp_mode_always` is set, MADV_HUGEPAGE is applied to large
+//! aligned allocations (>= 8 MiB, aligned to huge page size).
+//!
+//! ## NUMA Support
+//!
+//! Basic NUMA detection is available via `unix_detect_numa()` and
+//! `prim_numa_node()`. Currently informational only - no NUMA-aware
+//! allocation policies are implemented.
+//!
+//! ## Configuration
+//!
+//! `OsMemConfig` holds system-dependent parameters:
+//! - `page_size`: Base page size (usually 4 KiB)
+//! - `large_page_size`: Huge page size (usually 2 MiB)
+//! - `has_overcommit`: Whether OS allows overcommit
+//! - `thp`: Transparent huge pages mode
+
 const std = @import("std");
 const utils = @import("util.zig");
 const assert = utils.assert;
 const linux = std.os.linux;
 const posix = std.posix;
-const stats = @import("stats.zig");
 const types = @import("types.zig");
 const builtin = @import("builtin");
 const Atomic = std.atomic.Value;
@@ -100,7 +133,7 @@ pub inline fn prim_decommit(mem: []align(mem_config_static.page_size) u8, needs_
 
     needs_recommit.* = false;
     // decommit: use MADV_DONTNEED as it decreases rss immediately (unlike MADV_FREE)
-    try posix.madvise(mem.ptr, mem.len, posix.MADV.DONTNEED);
+    try posix.madvise(mem.ptr, mem.len, posix.MADV.FREE);
 }
 
 pub inline fn prim_protect(mem: []align(mem_config_static.page_size) u8, do_protect: bool) !void {
@@ -187,10 +220,8 @@ pub inline fn os_good_size(size: usize) usize {
     return utils.alignForward(usize, size, align_size);
 }
 
-pub fn os_commit_ex(mem: []u8, is_zero: *bool, stat_size: usize) bool {
+pub fn os_commit_ex(mem: []u8, is_zero: *bool, _: usize) bool {
     is_zero.* = false;
-    stats.main_stats.addCount(.committed, @intCast(stat_size));
-    stats.main_stats.incCounter(.commit_calls);
 
     var csize: usize = undefined;
     const start = page_align_area(false, mem.ptr, mem.len, &csize) orelse return true;
@@ -202,10 +233,8 @@ pub fn os_commit_ex(mem: []u8, is_zero: *bool, stat_size: usize) bool {
     return true;
 }
 
-pub fn os_decommit_ex(mem: []u8, needs_recommit: *bool, stat_size: usize) bool {
+pub fn os_decommit_ex(mem: []u8, needs_recommit: *bool, _: usize) bool {
     needs_recommit.* = true;
-
-    stats.main_stats.subCount(.committed, @intCast(stat_size));
 
     var csize: usize = undefined;
     const start = page_align_area(true, mem.ptr, mem.len, &csize) orelse return true;
@@ -217,9 +246,6 @@ pub fn os_decommit_ex(mem: []u8, needs_recommit: *bool, stat_size: usize) bool {
 pub fn os_reset(mem: []u8) bool {
     var csize: usize = undefined;
     const start = page_align_area(true, mem.ptr, mem.len, &csize) orelse return true;
-
-    stats.main_stats.addCount(._reset, @intCast(csize));
-    stats.main_stats.incCounter(.reset_calls);
 
     prim_reset(start[0..]) catch false;
     return true;
@@ -404,7 +430,7 @@ pub fn commitEx(mem: []u8, is_zero: *bool) bool {
 }
 
 /// Commit memory
-pub fn commit(ptr: [*]u8, size: usize) bool {
+pub inline fn commit(ptr: [*]u8, size: usize) bool {
     if (size == 0) return true;
 
     var csize: usize = undefined;
@@ -415,7 +441,6 @@ pub fn commit(ptr: [*]u8, size: usize) bool {
     const aligned_start: [*]align(mem_config_static.page_size) u8 = @alignCast(start);
     prim_commit(aligned_start[0..csize], &os_zero) catch return false;
 
-    stats.main_stats.addCount(.committed, @intCast(csize));
     return true;
 }
 
@@ -455,7 +480,7 @@ pub fn unprotect(mem: []u8) !void {
 }
 
 /// Decommit memory (make it not backed by physical memory)
-pub fn decommit(ptr: [*]u8, size: usize) bool {
+pub inline fn decommit(ptr: [*]u8, size: usize) bool {
     if (size == 0) return true;
 
     var csize: usize = undefined;
@@ -463,9 +488,8 @@ pub fn decommit(ptr: [*]u8, size: usize) bool {
     if (csize == 0) return true;
 
     var needs_recommit: bool = false;
-    prim_decommit(start[0..csize], &needs_recommit) catch return false;
+    prim_decommit(@alignCast(start[0..csize]), &needs_recommit) catch return false;
 
-    stats.main_stats.subCount(.committed, @intCast(csize));
     return true;
 }
 

@@ -3,5 +3,6 @@ zig-out/
 *.o
 perf.*
 malloc.asm
+malloc_slow.asm
 segments.asm
 free.asm

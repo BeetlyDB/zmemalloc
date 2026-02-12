@@ -1,3 +1,31 @@
+//! # Utility Functions
+//!
+//! Common helper functions used throughout the allocator.
+//!
+//! ## Alignment Operations
+//!
+//! - `alignForward(addr, alignment)`: Round up to next aligned address
+//! - `alignBackward(addr, alignment)`: Round down to previous aligned address
+//! - `alignPointer(ptr, alignment)`: Align a pointer with overflow checking
+//! - `isAligned(addr, alignment)`: Check if address is aligned
+//!
+//! ## Memory Operations
+//!
+//! - `memIsZero(buf)`: SIMD-optimized zero check for buffers
+//! - `zeroed(bytes)`: Byte-by-byte zero check for small buffers
+//!
+//! ## System Detection
+//!
+//! - `unix_detect_overcommit()`: Check if OS allows memory overcommit
+//! - `unix_detect_thp()`: Check if Transparent Huge Pages are enabled
+//! - `phisical_memory()`: Get total physical memory in KiB
+//!
+//! ## Math Helpers
+//!
+//! - `divCeil(n, d)`: Ceiling division (n / d rounded up)
+//! - `clamp(val, min, max)`: Clamp value to range
+//! - `isPowerOfTwo(n)`: Check if n is a power of two
+
 const std = @import("std");
 const builtin = @import("builtin");
 const testing = std.testing;
@@ -5,6 +33,12 @@ const types = @import("types.zig");
 const posix = std.posix;
 const linux = std.os.linux;
 
+/// Detect if Linux is configured to allow memory overcommit
+///
+/// Reads /proc/sys/vm/overcommit_memory:
+/// - 0: Heuristic overcommit (default, generally allows overcommit)
+/// - 1: Always overcommit
+/// - 2: Never overcommit
 pub fn unix_detect_overcommit() bool {
     var os_overcommited: bool = true;
 

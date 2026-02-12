@@ -47,6 +47,7 @@ pub fn build(b: *std.Build) void {
 
     const optimize = b.standardOptimizeOption(.{});
     const conf = generateConfig(b, optimize, target);
+
     const mod = b.addModule("zmemalloc", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
