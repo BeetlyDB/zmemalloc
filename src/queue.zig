@@ -208,8 +208,6 @@ pub fn DoublyLinkedListType(
             assert(@field(node, field_back) == null);
             assert(@field(node, field_next) == null);
 
-            @prefetch(node, .{ .cache = .data, .locality = 3, .rw = .read });
-
             if (list.tail) |tail| {
                 assert(list.count > 0);
                 assert(@field(tail, field_next) == null);
@@ -602,7 +600,6 @@ const IntrusiveLifoAny = struct {
 
     inline fn push(self: *Self, link: *IntrusiveLifoLink) void {
         link.next = self.head;
-        @prefetch(link.next, .{ .cache = .data, .locality = 3, .rw = .read });
         self.head = link;
     }
 
@@ -610,7 +607,6 @@ const IntrusiveLifoAny = struct {
         const link = self.head orelse return null;
         self.head = link.next;
         if (link.next) |next_link| {
-            @branchHint(.likely);
             @prefetch(next_link, .{ .cache = .data, .locality = 3, .rw = .read });
         }
         return link;

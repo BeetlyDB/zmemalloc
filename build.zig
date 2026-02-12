@@ -52,7 +52,6 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    strip(mod);
     mod.addImport("config", conf);
 
     const lib_mod = b.createModule(.{
@@ -230,7 +229,7 @@ fn build_module(
 
 fn strip(root_module: *std.Build.Module) void {
     if (root_module.optimize != .Debug and root_module.optimize != .ReleaseSafe) {
-        // root_module.strip = true;
+        root_module.strip = true;
         root_module.omit_frame_pointer = true;
         root_module.unwind_tables = .none;
         root_module.sanitize_c = .off;

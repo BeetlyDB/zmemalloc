@@ -42,26 +42,27 @@ threadlocal var tld: TLD = .{};
 threadlocal var tld_initialized: bool = false;
 // Direct heap pointer — also serves as init sentinel (null = not initialized)
 threadlocal var cached_heap: ?*Heap = null;
+/// Cached thread ID for fast comparison in free path
+threadlocal var cached_thread_id: usize = 0;
 /// Last purge check timestamp (for time-based purge delay)
 threadlocal var last_purge_check: i64 = 0;
 
 inline fn ensureTldInitialized() *TLD {
     if (cached_heap == null) {
-        @branchHint(.cold);
-        initTld(&tld);
-        tld_initialized = true;
-        cached_heap = tld.heap_backing;
-        _ = active_thread_count.fetchAdd(1, .monotonic);
+        @branchHint(.unlikely);
+        _ = initHeapSlow();
     }
     return &tld;
 }
 
 /// Get heap for fast path or initialize TLD — single threadlocal read
 inline fn getHeapOrInit() *Heap {
-    if (cached_heap) |h| {
-        @branchHint(.likely);
-        return h;
-    }
+    if (cached_heap) |h| return h;
+    return initHeapSlow();
+}
+
+/// Cold path for heap initialization - NOT inline to keep malloc hot path small
+noinline fn initHeapSlow() *Heap {
     initTld(&tld);
     tld_initialized = true;
     cached_heap = tld.heap_backing;
@@ -69,9 +70,13 @@ inline fn getHeapOrInit() *Heap {
     return cached_heap.?;
 }
 
+/// Initialize TLD - NOT inline to avoid AVX register pollution in malloc hot path
+/// This prevents vzeroupper from being needed in malloc's epilogue
 inline fn initTld(t: *TLD) void {
+    std.mem.doNotOptimizeAway(t);
     // Use TLD address as thread ID - fast, no syscall
     const thread_id = @intFromPtr(t);
+    cached_thread_id = thread_id; // Cache for fast free path
 
     t.segments = segment_mod.SegmentsTLD.init(t.os_allocator.allocator());
     t.segments.subproc = &global_subproc;
@@ -283,9 +288,9 @@ inline fn clearDirectPointersForPage(heap: *Heap, page: *Page) void {
     }
 }
 
-/// Get fast thread ID - uses TLD address (unique per thread, no syscall)
+/// Get fast thread ID - cached for minimal overhead in free path
 inline fn fastThreadId() usize {
-    return @intFromPtr(&tld);
+    return cached_thread_id;
 }
 
 /// Cold path for free - handle full page becoming non-full

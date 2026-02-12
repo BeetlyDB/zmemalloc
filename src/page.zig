@@ -316,7 +316,7 @@ pub const Page = struct {
         tail.link.next = if (self.free.any.head) |h| h else null;
         self.free.any.head = &head.link;
 
-        self.used -|= @intCast(@min(count, self.used));
+        self.used -= @intCast(@min(count, self.used));
         return count;
     }
 
@@ -403,9 +403,10 @@ pub const Page = struct {
     }
 
     /// Push freed block directly to local_free list
+    /// Note: uses regular decrement (not saturating) since used is always >= 1 when freeing
     pub inline fn pushFreeBlock(self: *Self, block: *Block) void {
         self.local_free.push(block);
-        self.used -|= 1;
+        self.used -= 1;
     }
 
     /// Reset page to initial state

@@ -11,7 +11,7 @@ zmemalloc is a thread-local memory allocator using segment-based memory manageme
 - Three-level free list sharding (free, local_free, xthread_free)
 - Bump pointer allocation for fresh pages
 - Lock-free cross-thread free
-- Comptime page shifts (no memory loads in hot path)
+- Comptime page shifts 
 
 ## Memory Hierarchy
 
