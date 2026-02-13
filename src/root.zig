@@ -88,7 +88,7 @@ const PURGE_DELAY_MS: i64 = 100;
 
 /// Trigger full page scan when this many cross-thread frees are pending
 /// Higher = less scanning overhead, but more memory retention
-const XTHREAD_COLLECT_THRESHOLD: usize = 1024;
+const XTHREAD_COLLECT_THRESHOLD: usize = 4096;
 
 // =============================================================================
 // Global State (Process-wide, shared across all threads)
@@ -760,7 +760,7 @@ const MAX_FAST_SIZE: usize = types.SMALL_WSIZE_MAX * types.INTPTR_SIZE;
 /// Periodic maintenance - isolated to prevent AVX contamination of malloc hot path
 noinline fn doPeriodicMaintenance(heap: *Heap) void {
     const pending = page_mod.pending_xthread_free.load(.monotonic);
-    if (pending > 64) {
+    if (pending > 256) {
         if (heap.tld) |t| {
             _ = reclaimFullPages(t, heap);
         }
@@ -787,12 +787,12 @@ pub fn malloc(size: usize) ?[*]u8 {
     // Single threadlocal read — also initializes TLD on first call
     const heap = getHeapOrInit();
 
-    // Periodic maintenance every 256 allocations
-    alloc_count +%= 1;
-    if (alloc_count & 0xFF == 0) {
-        @branchHint(.unlikely);
-        doPeriodicMaintenance(heap);
-    }
+    // // Periodic maintenance every 1024 allocations
+    // alloc_count +%= 1;
+    // if (alloc_count & 0x3FF == 0) {
+    //     @branchHint(.unlikely);
+    //     doPeriodicMaintenance(heap);
+    // }
 
     // Fast path: direct page lookup for small sizes (< 1KB)
     if (size <= MAX_FAST_SIZE) {

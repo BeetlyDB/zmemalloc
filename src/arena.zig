@@ -143,7 +143,7 @@ pub const Arenas = struct {
     }
 
     /// Try purge across all arenas
-    pub fn tryPurge(self: *Self, force: bool) void {
+    pub inline fn tryPurge(self: *Self, force: bool) void {
         const now = std.time.milliTimestamp();
         const expire = self.purge_expire.load(.acquire);
 
@@ -463,7 +463,7 @@ pub const Arena = struct {
     }
 
     /// Try to execute pending purge operations
-    pub fn tryPurge(self: *Self, force: bool) void {
+    pub inline fn tryPurge(self: *Self, force: bool) void {
         if (self.is_large) return;
 
         const now = std.time.milliTimestamp();

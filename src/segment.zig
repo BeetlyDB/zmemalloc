@@ -1080,12 +1080,12 @@ pub const SegmentsTLD = struct {
 
     /// Collect and purge pages across all segments.
     /// When force=true, also frees empty segments back to the OS.
-    pub fn collect(self: *Self, force: bool) usize {
+    pub inline fn collect(self: *Self, force: bool) usize {
         var collected: usize = 0;
         const now = std.time.milliTimestamp();
 
         // Collect segments to free (can't modify queue while iterating)
-        var segments_to_free: [64]*Segment = undefined;
+        var segments_to_free: [128]*Segment = undefined;
         var free_count: usize = 0;
 
         // Iterate through free queues and purge expired pages
