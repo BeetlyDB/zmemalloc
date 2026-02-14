@@ -48,6 +48,7 @@ const os_mod = @import("os.zig");
 const assert = util.assert;
 const subproc_m = @import("subproc.zig");
 const Mutex = @import("mutex.zig").Mutex;
+const fast_div = @import("fast_div.zig");
 
 const Atomic = std.atomic.Value;
 const Page = page_mod.Page;
@@ -213,8 +214,10 @@ pub const Segment = struct {
         // Small/medium: multiple pages per segment
         const psize_raw = @as(usize, 1) << @intCast(self.page_shift);
 
+        const pp = fast_div.FastDiv(u64).init(psize_raw);
+
         // Calculate how many page-sized slices the segment header uses
-        const info_slices = (self.segment_info_size + psize_raw - 1) / psize_raw;
+        const info_slices = pp.div(self.segment_info_size + psize_raw - 1);
 
         // Actual page index accounting for header slices
         const effective_idx = pg.segment_idx() + info_slices;
@@ -364,7 +367,7 @@ pub const Segment = struct {
         return true;
     }
 
-    pub fn findFreePage(self: *Self) ?*Page {
+    pub inline fn findFreePage(self: *Self) ?*Page {
         const cap = self.capacity;
         if (cap == 0) return null;
 
@@ -411,8 +414,9 @@ pub const Segment = struct {
         // Reserve slices for segment header
         // Header size is approximately @sizeOf(Segment) aligned up
         const page_size = @as(usize, 1) << @intCast(page_shift);
+        const pp = fast_div.FastDiv(u64).init(page_size);
         const header_size = @sizeOf(Self);
-        const header_slices = (header_size + page_size - 1) / page_size;
+        const header_slices = pp.div(header_size + page_size - 1);
 
         return switch (kind) {
             .huge, .large => 1,

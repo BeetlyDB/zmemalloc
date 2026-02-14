@@ -84,7 +84,7 @@ pub const Mutex = struct {
         }
     }
 
-    fn lockSlow(self: *Mutex) void {
+    noinline fn lockSlow(self: *Mutex) void {
         @branchHint(.cold);
         var current_state = self.state.load(.monotonic);
         if (current_state == UNLOCKED) {

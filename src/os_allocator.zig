@@ -100,10 +100,15 @@ pub inline fn map(self: *const OsAllocator, n: usize, alignment: mem.Alignment) 
         @branchHint(.cold);
         return null;
     };
+
+    //does not enable for always hugepages,use only when madvise specified
     if (self.config.thp == .thp_mode_always) {
-        @branchHint(.likely);
         os.maybe_enable_thp(result_ptr, aligned_len, alignment_bytes, self.config.thp);
     }
+    // if (self.config.thp == .thp_mode_always) {
+    //     @branchHint(.likely);
+    //     os.maybe_enable_thp(result_ptr, aligned_len, alignment_bytes, self.config.thp);
+    // }
     // Unmap the extra bytes that were only requested in order to guarantee
     // that the range of memory we were provided had a proper alignment in it
     // somewhere. The extra bytes could be at the beginning, or end, or both.

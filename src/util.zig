@@ -32,6 +32,7 @@ const testing = std.testing;
 const types = @import("types.zig");
 const posix = std.posix;
 const linux = std.os.linux;
+const fast_div = @import("fast_div.zig");
 
 /// Detect if Linux is configured to allow memory overcommit
 ///
@@ -62,7 +63,7 @@ pub inline fn phisical_memory() ?usize {
 }
 
 pub inline fn unix_detect_thp() bool {
-    const sys_state_always = "[always] madvise never\n";
+    const sys_state_always = "always [madvise] never\n";
 
     const fd = posix.open("/sys/kernel/mm/transparent_hugepage/enabled", .{ .ACCMODE = .RDONLY }, 0) catch return false;
     defer posix.close(fd);

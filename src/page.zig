@@ -54,6 +54,7 @@ const Atomic = std.atomic.Value;
 const builtin = @import("builtin");
 const assert = @import("util.zig").assert;
 const heap = @import("heap.zig");
+const fast_div = @import("fast_div.zig");
 
 /// Global counter of pending cross-thread frees
 /// When this exceeds a threshold, triggers collection in malloc path
@@ -242,7 +243,7 @@ pub const Page = struct {
     }
 
     /// Initialize page for use with given block size
-    pub fn init(self: *Self, block_size: usize, page_start: [*]u8, page_size: usize) void {
+    pub inline fn init(self: *Self, block_size: usize, page_start: [*]u8, page_size: usize) void {
         self.block_size = block_size;
         self.page_start = page_start;
         self.used = 0;
@@ -250,9 +251,11 @@ pub const Page = struct {
         self.local_free_head = null;
         self.xthread_free.store(null, .release);
 
+        const pp = fast_div.FastDiv(u64).init(block_size);
+
         // Calculate capacity
         if (block_size > 0 and page_size >= block_size) {
-            self.capacity = @intCast(page_size / block_size);
+            self.capacity = @intCast(pp.div(page_size));
             self.reserved = 0; // Bump pointer starts at 0
         } else {
             self.capacity = 0;
