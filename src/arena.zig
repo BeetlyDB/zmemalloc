@@ -57,7 +57,8 @@ pub const ARENA_BLOCK_SIZE: usize = types.SEGMENT_SIZE; // 32 MiB
 pub const ARENA_MIN_OBJ_SIZE: usize = ARENA_BLOCK_SIZE / 2; // 16 MiB minimum for arena alloc
 
 /// Default purge delay in milliseconds
-pub const PURGE_DELAY_MS: i64 = 100;
+/// Lower values = more aggressive memory return, higher syscall overhead
+pub const PURGE_DELAY_MS: i64 = 10;
 
 pub const Arenas = struct {
     const Self = @This();
@@ -441,7 +442,7 @@ pub const Arena = struct {
             // Mark blocks for purge
             _ = purge.claimAcross(block_idx, count);
 
-            // Set expiration time
+            // Set expiration time on this arena
             const now = std.time.milliTimestamp();
             const expire = now + PURGE_DELAY_MS;
 
@@ -459,6 +460,9 @@ pub const Arena = struct {
                     break;
                 }
             }
+
+            // Also update global Arenas expire so tryPurge knows to check
+            globalArenas().updatePurgeExpire(expire);
         }
     }
 

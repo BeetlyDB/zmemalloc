@@ -79,8 +79,8 @@ pub const Page = struct {
     const Self = @This();
 
     // === Hot path fields (32 bytes) ===
-    /// Main free list head pointer (IntrusiveLifoLink*)
-    free_head: ?*anyopaque = null,
+    /// Main free list head - intrusive linked list of free blocks
+    free_head: ?*list.IntrusiveLifoLink = null,
     /// Start of allocatable memory area within segment
     page_start: ?[*]u8 = null,
     /// Size of each block in this page (all blocks same size)
@@ -95,8 +95,8 @@ pub const Page = struct {
     flags_and_idx: u16 = 0,
 
     // === Queue fields (32 bytes) ===
-    /// Same-thread freed blocks head pointer
-    local_free_head: ?*anyopaque = null,
+    /// Same-thread freed blocks - intrusive linked list
+    local_free_head: ?*list.IntrusiveLifoLink = null,
     /// Cross-thread freed blocks - atomic lock-free list
     xthread_free: Atomic(?*Block) = .init(null),
     /// Next page in heap's bin queue
@@ -322,7 +322,7 @@ pub const Page = struct {
 
         // Splice: tail.next = free.head, free.head = xthread_head
         // This prepends entire xthread list to free in O(1) after the walk
-        tail.link.next = @ptrCast(@alignCast(self.free_head));
+        tail.link.next = self.free_head;
         self.free_head = &head.link;
 
         self.used -|= @intCast(@min(count, self.used));
@@ -355,13 +355,12 @@ pub const Page = struct {
 
     /// Pop from free list - simple linked list, no branching
     inline fn popFromFreeList(self: *Self) ?[*]u8 {
-        const link: ?*list.IntrusiveLifoLink = @ptrCast(@alignCast(self.free_head));
-        if (link) |l| {
-            self.free_head = l.next;
-            if (l.next) |next| {
+        if (self.free_head) |link| {
+            self.free_head = link.next;
+            if (link.next) |next| {
                 @prefetch(next, .{ .cache = .data, .locality = 3, .rw = .read });
             }
-            return @ptrCast(l);
+            return @ptrCast(link);
         }
         return null;
     }
@@ -369,23 +368,22 @@ pub const Page = struct {
     /// Push to free list - simple linked list
     inline fn pushToFreeList(self: *Self, block: [*]u8) void {
         const link: *list.IntrusiveLifoLink = @ptrCast(@alignCast(block));
-        link.next = @ptrCast(@alignCast(self.free_head));
+        link.next = self.free_head;
         self.free_head = link;
     }
 
     /// Push to local_free list - simple linked list
     inline fn pushToLocalFreeList(self: *Self, block: [*]u8) void {
         const link: *list.IntrusiveLifoLink = @ptrCast(@alignCast(block));
-        link.next = @ptrCast(@alignCast(self.local_free_head));
+        link.next = self.local_free_head;
         self.local_free_head = link;
     }
 
     /// Pop from local_free list
     inline fn popFromLocalFreeList(self: *Self) ?[*]u8 {
-        const link: ?*list.IntrusiveLifoLink = @ptrCast(@alignCast(self.local_free_head));
-        if (link) |l| {
-            self.local_free_head = l.next;
-            return @ptrCast(l);
+        if (self.local_free_head) |link| {
+            self.local_free_head = link.next;
+            return @ptrCast(link);
         }
         return null;
     }
@@ -528,6 +526,40 @@ pub fn blockSizeForBin(bin: usize) usize {
     const wsize = max_w + 1;
 
     return wsize * types.INTPTR_SIZE;
+}
+
+/// Get the maximum wsize that maps to a bin (without multiplication by INTPTR_SIZE)
+pub inline fn maxWsizeForBin(bin: usize) usize {
+    if (bin <= 1) return 1;
+    if (bin <= 8) return bin;
+
+    const b = (bin + 3) >> 2;
+    const rem = (bin + 3) & 3;
+    const shift_b: u6 = @intCast(b);
+    const shift_b2: u6 = @intCast(b - 2);
+
+    const max_w = (@as(usize, 1) << shift_b) | (rem << shift_b2) | ((@as(usize, 1) << shift_b2) - 1);
+    return max_w + 1;
+}
+
+/// Get the minimum wsize that maps to a bin
+/// For bins 1-8: min == max (direct mapping)
+/// For bins >= 9: uses logarithmic formula inverse
+pub inline fn minWsizeForBin(bin: usize) usize {
+    if (bin <= 1) return 1;
+    if (bin <= 8) return bin;
+
+    // Reverse binFromWsize formula to find minimum w
+    // bin + 3 = (b << 2) | ((w >> (b-2)) & 3)
+    // where b = floor(log2(w)) and w = wsize - 1
+    const b = (bin + 3) >> 2;
+    const rem = (bin + 3) & 3;
+    const shift_b: u6 = @intCast(b);
+    const shift_b2: u6 = @intCast(b - 2);
+
+    // Minimum w: set bit b, set bits (b-1, b-2) to rem, lower bits to 0
+    const min_w = (@as(usize, 1) << shift_b) | (rem << shift_b2);
+    return min_w + 1;
 }
 
 /// Check if size qualifies for small allocation

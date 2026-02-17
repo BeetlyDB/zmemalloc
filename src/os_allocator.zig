@@ -137,7 +137,13 @@ fn resize(context: *anyopaque, memory: []u8, alignment: mem.Alignment, new_len: 
     return self.realloc(memory, new_len, false) != null;
 }
 
-fn remap(context: *anyopaque, memory: []u8, alignment: mem.Alignment, new_len: usize, return_address: usize) ?[*]u8 {
+fn remap(
+    context: *anyopaque,
+    memory: []u8,
+    alignment: mem.Alignment,
+    new_len: usize,
+    return_address: usize,
+) ?[*]u8 {
     _ = alignment;
     _ = return_address;
     const self: *OsAllocator = @ptrCast(@alignCast(context));

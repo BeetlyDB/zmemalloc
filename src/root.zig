@@ -60,6 +60,7 @@ const page_mod = @import("page.zig");
 const heap_mod = @import("heap.zig");
 const segment_mod = @import("segment.zig");
 const tld_mod = @import("tld.zig");
+const arena_mod = @import("arena.zig");
 const os = @import("os.zig");
 const os_alloc = @import("os_allocator.zig");
 const Subproc = @import("subproc.zig").Subproc;
@@ -78,13 +79,6 @@ const SegmentAbandonedQueue = segment_mod.SegmentAbandonedQueue;
 
 /// Max segments to reclaim from abandoned queue per allocation attempt
 const ABANDON_RECLAIM_LIMIT: usize = 16;
-
-/// Trigger aggressive memory reduction when segment count exceeds this
-const SEGMENT_HIGH_WATERMARK: usize = 16;
-
-/// Delay before purging freed pages to OS (milliseconds)
-/// Prevents thrashing when memory is freed and reallocated quickly
-const PURGE_DELAY_MS: i64 = 100;
 
 /// Trigger full page scan when this many cross-thread frees are pending
 /// Higher = less scanning overhead, but more memory retention
@@ -125,11 +119,6 @@ threadlocal var cached_heap: ?*Heap = null;
 /// Cached thread ID (TLD address) for fast same-thread check in free()
 threadlocal var cached_thread_id: usize = 0;
 
-/// Timestamp of last purge check (prevents frequent syscalls)
-threadlocal var last_purge_check: i64 = 0;
-
-/// Allocation counter for periodic maintenance tasks
-threadlocal var alloc_count: usize = 0;
 
 // =============================================================================
 // Thread-Local Initialization
@@ -334,17 +323,15 @@ inline fn setDirectPointerForBlockSize(heap: *Heap, page: *Page) void {
     const bin = page_mod.binFromWsize(block_wsize);
     if (bin <= 8) return; // For bins 1-8, wsize == bin == block_wsize, already handled
 
-    // For larger bins, find the minimum wsize that maps to this bin
-    // and set direct pointers for the range [min_wsize, block_wsize]
-    var wsize: usize = block_wsize;
-    while (wsize > 8 and page_mod.binFromWsize(wsize - 1) == bin) {
-        wsize -= 1;
-    }
-    // Set pointers for all wsizes in this bin
-    while (wsize <= block_wsize) : (wsize += 1) {
-        if (wsize <= types.SMALL_WSIZE_MAX) {
-            heap.pages_free_direct[wsize] = page;
-        }
+    // Use direct calculation instead of loop with binFromWsize
+    // This avoids expensive lzcnt/shift operations per iteration
+    const min_wsize = page_mod.minWsizeForBin(bin);
+    const max_wsize = @min(block_wsize, types.SMALL_WSIZE_MAX);
+
+    // Set pointers for all wsizes in this bin's range
+    var wsize: usize = min_wsize;
+    while (wsize <= max_wsize) : (wsize += 1) {
+        heap.pages_free_direct[wsize] = page;
     }
 }
 
@@ -352,34 +339,6 @@ inline fn setDirectPointerForBlockSize(heap: *Heap, page: *Page) void {
 // Memory Maintenance (Background Tasks)
 // =============================================================================
 
-/// Periodic memory return to OS
-///
-/// Called during allocation to release unused memory back to the OS.
-/// Uses time-based throttling to avoid syscall overhead.
-///
-/// Tasks performed:
-/// 1. Free empty segments
-/// 2. Decommit freed arena blocks (MADV_DONTNEED)
-/// 3. Aggressive reduction if over high watermark
-inline fn tryPurgeDelayed() void {
-    if (!tld_initialized) return;
-
-    const now = std.time.milliTimestamp();
-    if (now - last_purge_check < PURGE_DELAY_MS) return;
-    last_purge_check = now;
-
-    // Free empty segments
-    _ = tld.segments.collect(false);
-
-    // Decommit freed arena blocks
-    const arena_mod = @import("arena.zig");
-    arena_mod.globalArenas().tryPurge(false);
-
-    // Aggressive reduction if holding too many segments
-    if (tld.segments.count > SEGMENT_HIGH_WATERMARK) {
-        _ = tld.segments.reduceMemory(SEGMENT_HIGH_WATERMARK / 2);
-    }
-}
 
 /// **Slow Path**: Full allocation logic when fast/medium paths fail
 ///
@@ -402,6 +361,10 @@ inline fn mallocGeneric(heap: *Heap, size: usize, zero: bool) ?[*]u8 {
         _ = t.segments.collectAllXthreadFree();
         _ = reclaimFullPages(t, heap);
     }
+
+    // Check for pending arena purges (mimalloc-style deferred decommit)
+    // Arena's tryPurge has its own time-based throttling via purge_expire
+    arena_mod.globalArenas().tryPurge(false);
 
     // Round up to bin's block size - this allows page reuse across similar sizes
     const bin = page_mod.binFromSize(size);
@@ -510,12 +473,13 @@ inline fn clearDirectPointersForPage(heap: *Heap, page: *Page) void {
     const bin = page_mod.binFromWsize(block_wsize);
     if (bin <= 8) return;
 
-    var wsize: usize = block_wsize;
-    while (wsize > 8 and page_mod.binFromWsize(wsize - 1) == bin) {
-        wsize -= 1;
-    }
-    while (wsize <= block_wsize) : (wsize += 1) {
-        if (wsize <= types.SMALL_WSIZE_MAX and heap.pages_free_direct[wsize] == page) {
+    // Use direct calculation instead of loop with binFromWsize
+    const min_wsize = page_mod.minWsizeForBin(bin);
+    const max_wsize = @min(block_wsize, types.SMALL_WSIZE_MAX);
+
+    var wsize: usize = min_wsize;
+    while (wsize <= max_wsize) : (wsize += 1) {
+        if (heap.pages_free_direct[wsize] == page) {
             heap.pages_free_direct[wsize] = null;
         }
     }
@@ -757,17 +721,6 @@ pub const ZMemAllocator = struct {
 /// Maximum size for fast path (fits in direct page lookup)
 const MAX_FAST_SIZE: usize = types.SMALL_WSIZE_MAX * types.INTPTR_SIZE;
 
-/// Periodic maintenance - isolated to prevent AVX contamination of malloc hot path
-noinline fn doPeriodicMaintenance(heap: *Heap) void {
-    const pending = page_mod.pending_xthread_free.load(.monotonic);
-    if (pending > 256) {
-        if (heap.tld) |t| {
-            _ = reclaimFullPages(t, heap);
-        }
-    }
-    tryPurgeDelayed();
-}
-
 /// Slow path when fast allocation fails - noinline to reduce register pressure in malloc
 noinline fn mallocSlowPath(heap: *Heap, size: usize) ?[*]u8 {
     // Try medium path first (bin queue lookup)
@@ -786,13 +739,6 @@ pub fn malloc(size: usize) ?[*]u8 {
 
     // Single threadlocal read — also initializes TLD on first call
     const heap = getHeapOrInit();
-
-    // // Periodic maintenance every 1024 allocations
-    // alloc_count +%= 1;
-    // if (alloc_count & 0x3FF == 0) {
-    //     @branchHint(.unlikely);
-    //     doPeriodicMaintenance(heap);
-    // }
 
     // Fast path: direct page lookup for small sizes (< 1KB)
     if (size <= MAX_FAST_SIZE) {
@@ -924,7 +870,6 @@ pub fn collect(force: bool) usize {
     collected += tld.segments.collect(force);
 
     // Purge freed arena blocks (return memory to OS)
-    const arena_mod = @import("arena.zig");
     arena_mod.globalArenas().tryPurge(force);
 
     return collected;

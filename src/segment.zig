@@ -652,8 +652,7 @@ pub const SegmentsTLD = struct {
 
         var mem_id: MemID = .{};
 
-        // For huge segments, use direct OS allocation to avoid arena complexity
-        // Arena blocks are 32MB which may not handle huge segments well
+        // For huge segments, use direct OS allocation
         if (page_kind == .huge) {
             const alignment = std.mem.Alignment.fromByteUnits(types.SEGMENT_ALIGN);
             const os_ptr = self.os_alloc.rawAlloc(sizes.segment_size, alignment, @returnAddress()) orelse return null;
@@ -701,8 +700,9 @@ pub const SegmentsTLD = struct {
         }
 
         // No space in existing arenas - try to create a new one
-        // Reserve a large arena (e.g. 256 MiB = 8 segments worth)
-        const arena_size = @max(size, 8 * types.SEGMENT_SIZE);
+        // Start with smaller arena (64 MiB = 2 segments) to reduce RSS
+        // Arena will grow as needed via additional arenas
+        const arena_size = @max(size, 2 * types.SEGMENT_SIZE);
         const arena = arena_mod.reserve(
             arena_size,
             true, // commit
@@ -842,11 +842,12 @@ pub const SegmentsTLD = struct {
     // =========================================================================
 
     /// Threshold for segment count before we start aggressively freeing empty segments.
-    /// Each segment is 32MB, so 8 segments = 256MB of cached memory.
-    const SEGMENT_CACHE_THRESHOLD: usize = 8;
+    /// Each segment is 32MB, so 4 segments = 128MB of cached memory.
+    const SEGMENT_CACHE_THRESHOLD: usize = 4;
 
     /// How many empty segments to keep cached per queue type.
-    const EMPTY_SEGMENT_CACHE_MAX: usize = 2;
+    /// Keep minimal cache to reduce RSS while still avoiding mmap/munmap thrashing.
+    const EMPTY_SEGMENT_CACHE_MAX: usize = 1;
 
     /// Purge delay in milliseconds (mimalloc style)
     const PURGE_DELAY_MS: i64 = 10;

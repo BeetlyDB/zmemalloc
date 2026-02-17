@@ -132,7 +132,6 @@ pub inline fn prim_decommit(mem: []align(mem_config_static.page_size) u8, needs_
     if (mem.len == 0) return;
 
     needs_recommit.* = false;
-    // decommit: use MADV_DONTNEED as it decreases rss immediately (unlike MADV_FREE)
     try posix.madvise(mem.ptr, mem.len, posix.MADV.FREE);
 }
 

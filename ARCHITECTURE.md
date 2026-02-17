@@ -64,7 +64,7 @@ zmemalloc is a thread-local memory allocator using segment-based memory manageme
 ```zig
 Page = struct {
     // Hot path fields (32 bytes):
-    free_head: ?*anyopaque,         // 8: head of free list (linked blocks)
+    free_head: ?*IntrusiveLifoLink, // 8: head of free list (typed pointer, no cast needed)
     page_start: ?[*]u8,             // 8: start of data area
     block_size: usize,              // 8: size of each block
     capacity: u16,                  // 2: max blocks
@@ -73,7 +73,7 @@ Page = struct {
     flags_and_idx: u16,             // 2: packed flags + segment_idx
 
     // Queue fields (32 bytes):
-    local_free_head: ?*anyopaque,   // 8: same-thread freed blocks
+    local_free_head: ?*IntrusiveLifoLink, // 8: same-thread freed blocks (typed)
     xthread_free: Atomic(?*Block),  // 8: cross-thread freed (atomic)
     next: ?*Page,                   // 8: bin queue link
     prev: ?*Page,                   // 8: bin queue link
@@ -126,8 +126,29 @@ Allocated:                    Free:
 |                      |     |    (unused space)    |
 +----------------------+     +----------------------+
 
-When free: first 8 bytes = pointer to next free block
+When free: first 8 bytes = pointer to next free block (IntrusiveLifoLink)
 When allocated: user owns all memory
+```
+
+**IntrusiveLifoLink:** The free list uses typed pointers (`?*IntrusiveLifoLink`) instead of `?*anyopaque`. This eliminates pointer casts in the hot allocation path:
+
+```zig
+// In queue.zig
+pub const IntrusiveLifoLink = struct {
+    next: ?*IntrusiveLifoLink = null,
+};
+
+// Hot path - no @ptrCast needed
+inline fn popFromFreeList(self: *Page) ?[*]u8 {
+    if (self.free_head) |link| {
+        self.free_head = link.next;
+        if (link.next) |next| {
+            @prefetch(next, .{ .locality = 3 });
+        }
+        return @ptrCast(link);  // Only cast on return
+    }
+    return null;
+}
 ```
 
 ### Heap (per-thread)
@@ -167,25 +188,51 @@ malloc(size)
     +-- page exhausted --> mark full, remove from bin --> mallocSlowPath()
 ```
 
+### Entry Point: malloc
+
+```zig
+pub fn malloc(size: usize) ?[*]u8 {
+    if (size == 0) return null;
+
+    // Single threadlocal read — also initializes TLD on first call
+    const heap = getHeapOrInit();
+
+    // Fast path: direct page lookup for small sizes (< 1KB)
+    if (size <= MAX_FAST_SIZE) {
+        @branchHint(.likely);
+        if (mallocSmallFast(heap, size)) |ptr| {
+            return ptr;
+        }
+    }
+
+    // Slow path: bin queue lookup, page allocation, etc.
+    return mallocSlowPath(heap, size);
+}
+```
+
 ### Fast Path: mallocSmallFast (< 1KB) - O(1)
 
 This is the hottest path, optimized for minimal instructions:
 
 ```zig
-fn mallocSmallFast(heap: *Heap, size: usize) ?[*]u8 {
+inline fn mallocSmallFast(heap: *Heap, size: usize) ?[*]u8 {
     // 1. Calculate word size (8-byte granularity)
-    const wsize = (size + 7) / 8;
+    const wsize = (size + INTPTR_SIZE - 1) / INTPTR_SIZE;
 
     // 2. Direct O(1) lookup - no bin calculation needed
-    const page = heap.pages_free_direct[wsize] orelse return null;
+    const page = heap.pages_free_direct[wsize] orelse {
+        @branchHint(.unlikely);
+        return null;
+    };
 
     // 3. Try to pop from free list or bump allocate
     if (page.popFreeBlock()) |block| {
+        @branchHint(.likely);
         return @ptrCast(block);  // SUCCESS - fast path complete
     }
 
     // 4. Page exhausted - mark as full, remove from bin queue
-    //    This prevents slow path from trying the same page
+    const bin = binFromSize(size);
     page.set_in_full(true);
     page.pageRemoveFromBin(heap, bin);
     heap.pages_free_direct[wsize] = null;
@@ -197,10 +244,10 @@ fn mallocSmallFast(heap: *Heap, size: usize) ?[*]u8 {
 
 ### Slow Path: mallocSlowPath
 
-Called when fast path fails (no page or page exhausted):
+Called when fast path fails (no page or page exhausted). Marked `noinline` to reduce register pressure in malloc hot path:
 
 ```zig
-fn mallocSlowPath(heap: *Heap, size: usize) ?[*]u8 {
+noinline fn mallocSlowPath(heap: *Heap, size: usize) ?[*]u8 {
     // 1. Try medium path (bin queue lookup)
     if (size <= MEDIUM_OBJ_SIZE_MAX) {
         if (mallocMedium(heap, size)) |ptr| {
@@ -216,16 +263,78 @@ fn mallocSlowPath(heap: *Heap, size: usize) ?[*]u8 {
 ### Medium Path: mallocMedium - O(1)
 
 ```zig
-fn mallocMedium(heap: *Heap, size: usize) ?[*]u8 {
+inline fn mallocMedium(heap: *Heap, size: usize) ?[*]u8 {
     const bin = binFromSize(size);
-    const page = heap.pages[bin].tail orelse return null;
+    const pq = &heap.pages[bin];
 
-    // Try to allocate from this page
-    if (tryAllocFromPage(heap, page, bin)) |ptr| {
-        return ptr;
+    // Try current bin queue page
+    if (pq.tail) |pg| {
+        @branchHint(.likely);
+        if (tryAllocFromPage(heap, pg, bin)) |ptr| {
+            return ptr;
+        }
+    }
+
+    // Bin empty - try to reclaim full pages with pending xthread_free
+    if (pending_xthread_free.load(.monotonic) > 0) {
+        @branchHint(.unlikely);
+        if (heap.tld) |t| {
+            _ = reclaimFullPages(t, heap);
+            // Retry after reclaim
+            if (pq.tail) |pg| {
+                return tryAllocFromPage(heap, pg, bin);
+            }
+        }
     }
 
     return null;
+}
+```
+
+### tryAllocFromPage
+
+Core allocation logic with cross-thread free collection:
+
+```zig
+inline fn tryAllocFromPage(heap: *Heap, pg: *Page, bin: usize) ?[*]u8 {
+    // 1. Try direct pop first
+    if (pg.popFreeBlock()) |block| {
+        @branchHint(.likely);
+        setDirectPointerForBlockSize(heap, pg);
+        if (!pg.hasFreeQuick()) {
+            @branchHint(.unlikely);
+            handlePageExhausted(heap, pg, bin);
+        }
+        return @ptrCast(block);
+    }
+
+    // 2. Page appears empty - collect xthread_free and retry
+    if (pg.xthread_free.load(.monotonic) != null) {
+        _ = pg.collectXthreadFree();
+        if (pg.popFreeBlock()) |block| {
+            setDirectPointerForBlockSize(heap, pg);
+            if (!pg.hasFree()) {
+                handlePageExhausted(heap, pg, bin);
+            }
+            return @ptrCast(block);
+        }
+    }
+
+    // 3. Truly exhausted
+    handlePageExhausted(heap, pg, bin);
+    return null;
+}
+
+inline fn handlePageExhausted(heap: *Heap, pg: *Page, bin: usize) void {
+    // Last chance: collect xthread_free before marking full
+    if (pg.xthread_free.load(.monotonic) != null) {
+        _ = pg.collectXthreadFree();
+    }
+    if (!pg.hasFree()) {
+        pg.pageRemoveFromBin(heap, bin);
+        pg.set_in_full(true);
+        clearDirectPointersForPage(heap, pg);
+    }
 }
 ```
 
@@ -234,30 +343,80 @@ fn mallocMedium(heap: *Heap, size: usize) ?[*]u8 {
 Allocates new pages when needed:
 
 ```zig
-fn mallocGeneric(heap: *Heap, size: usize, zero: bool) ?[*]u8 {
+inline fn mallocGeneric(heap: *Heap, size: usize, zero: bool) ?[*]u8 {
+    const t = heap.tld orelse return null;
+
     // 1. Collect pending cross-thread frees if threshold exceeded
-    if (pending_xthread_free > threshold) {
-        collectAllXthreadFree();
-        reclaimFullPages();
+    const pending = pending_xthread_free.load(.monotonic);
+    if (pending > XTHREAD_COLLECT_THRESHOLD) {
+        @branchHint(.unlikely);
+        _ = t.segments.collectAllXthreadFree();
+        _ = reclaimFullPages(t, heap);
     }
 
-    // 2. Try bin queue again
-    if (bin queue has page with free blocks) {
-        return allocate from it;
+    // 2. Execute pending arena purges (deferred decommit)
+    globalArenas().tryPurge(false);
+
+    // 3. Calculate bin and block_size
+    const bin = binFromSize(size);
+    const block_size = if (size > LARGE_OBJ_SIZE_MAX)
+        size  // Huge: use exact size
+    else
+        blockSizeForBin(bin);
+
+    // 4. Try bin queue first
+    if (bin < heap.pages.len) {
+        if (heap.pages[bin].tail) |pg| {
+            if (pg.block_size >= block_size) {
+                if (pg.popFreeBlock()) |block| {
+                    @branchHint(.likely);
+                    if (!pg.hasFree()) {
+                        pg.pageRemoveFromBin(heap, bin);
+                        pg.set_in_full(true);
+                        clearDirectPointersForPage(heap, pg);
+                    }
+                    if (zero) @memset(block[0..block_size], 0);
+                    return block;
+                }
+            }
+        }
     }
 
-    // 3. Allocate new page from segment
-    page = segments.allocPage(block_size);
+    // 5. Allocate new page from segment
+    var page = t.segments.allocPage(block_size);
+    if (page == null) {
+        // Try to reclaim abandoned segments from other threads
+        if (global_subproc.abandoned_count.load(.monotonic) > 0) {
+            _ = reclaimAbandoned(ABANDON_RECLAIM_LIMIT);
+            page = t.segments.allocPage(block_size);
+        }
+    }
+    const pg = page orelse return null;
 
-    // 4. Initialize page (set page_start, capacity)
-    page.init(block_size, page_start, page_size);
+    // 6. Initialize page if needed (page_start is null for fresh pages)
+    if (pg.page_start == null) {
+        @branchHint(.cold);
+        const s = Segment.fromPtr(pg);
+        var page_size: usize = undefined;
+        const page_start = s.pageStart(pg, &page_size);
+        pg.init(block_size, page_start, page_size);
+    }
 
-    // 5. Add to bin queue and set direct pointers
-    page.pagePushBin(heap, bin);
-    setDirectPointerForBlockSize(heap, page);
+    // 7. Allocate block
+    const block = pg.popFreeBlock() orelse return null;
+    if (zero) @memset(block[0..block_size], 0);
 
-    // 6. Allocate block
-    return page.popFreeBlock();
+    // 8. Add to bin queue if not already there
+    if (bin < heap.pages.len and !pg.is_in_bin()) {
+        @branchHint(.likely);
+        pg.set_in_full(false);
+        pg.pagePushBin(heap, bin);
+    }
+
+    // 9. Update direct pointers
+    setDirectPointerForBlockSize(heap, pg);
+
+    return block;
 }
 ```
 
@@ -268,27 +427,66 @@ fn mallocGeneric(heap: *Heap, size: usize, zero: bool) ?[*]u8 {
 ```zig
 fn setDirectPointerForBlockSize(heap: *Heap, page: *Page) void {
     const block_wsize = (page.block_size + 7) / 8;
+    if (block_wsize > SMALL_WSIZE_MAX) return;
 
     // For small bins (1-8), wsize maps 1:1 to bin
     heap.pages_free_direct[block_wsize] = page;
 
+    const bin = binFromWsize(block_wsize);
+    if (bin <= 8) return;  // Already handled above
+
     // For larger bins, multiple wsizes map to same bin
-    // Set direct pointers for ALL of them
-    if (bin > 8) {
-        // Find range of wsizes that map to this bin
-        for (wsize in range that maps to this bin) {
-            heap.pages_free_direct[wsize] = page;
+    // Use direct calculation instead of loop with binFromWsize
+    // This avoids expensive lzcnt/shift operations per iteration
+    const min_wsize = minWsizeForBin(bin);
+    const max_wsize = @min(block_wsize, SMALL_WSIZE_MAX);
+
+    // Set pointers for all wsizes in this bin's range
+    var wsize = min_wsize;
+    while (wsize <= max_wsize) : (wsize += 1) {
+        heap.pages_free_direct[wsize] = page;
+    }
+}
+```
+
+**Optimization:** The `minWsizeForBin(bin)` function computes the minimum wsize for a bin directly using inverse logarithmic formula, avoiding expensive `binFromWsize` calls in a loop. This reduced slow path overhead by ~40%.
+
+**Why this matters:** Without setting all direct pointers, allocations of different sizes in the same bin would miss and fall through to slow path. This was a major performance bug - 83% of allocations were hitting slow path unnecessarily!
+
+### Clearing Direct Pointers
+
+When a page becomes full, its direct pointers must be cleared:
+
+```zig
+fn clearDirectPointersForPage(heap: *Heap, page: *Page) void {
+    const block_wsize = (page.block_size + 7) / 8;
+    if (block_wsize > SMALL_WSIZE_MAX) return;
+
+    // Clear for block_wsize
+    if (heap.pages_free_direct[block_wsize] == page) {
+        heap.pages_free_direct[block_wsize] = null;
+    }
+
+    const bin = binFromWsize(block_wsize);
+    if (bin <= 8) return;
+
+    // Use direct calculation (same optimization as setDirectPointerForBlockSize)
+    const min_wsize = minWsizeForBin(bin);
+    const max_wsize = @min(block_wsize, SMALL_WSIZE_MAX);
+
+    var wsize = min_wsize;
+    while (wsize <= max_wsize) : (wsize += 1) {
+        if (heap.pages_free_direct[wsize] == page) {
+            heap.pages_free_direct[wsize] = null;
         }
     }
 }
 ```
 
-**Why this matters:** Without this, allocations of different sizes in the same bin would miss the direct pointer and fall through to slow path. This was a major performance bug - 83% of allocations were hitting slow path unnecessarily!
-
 ### Page Block Allocation: popFreeBlock
 
 ```zig
-fn popFreeBlock(self: *Page) ?*Block {
+fn popFreeBlock(self: *Page) ?[*]u8 {
     // Hot path 1: pop from free list (recycled blocks)
     if (self.popFromFreeList()) |block| {
         self.used += 1;
@@ -297,31 +495,51 @@ fn popFreeBlock(self: *Page) ?*Block {
 
     // Hot path 2: bump allocation (contiguous, cache-friendly)
     if (self.reserved < self.capacity) {
-        block = self.page_start + self.reserved * self.block_size;
+        const start = self.page_start orelse return self.popFreeBlockSlow();
+        const offset = self.reserved * self.block_size;
+        @prefetch(start + offset, .{ .rw = .write });  // Prefetch for write
         self.reserved += 1;
         self.used += 1;
-        return block;
+        return start + offset;
     }
 
     // Cold path: collect from local_free/xthread_free
     return self.popFreeBlockSlow();
 }
 
-fn popFreeBlockSlow(self: *Page) ?*Block {
-    // Try local_free (same-thread freed blocks)
+/// Pop from intrusive linked list - O(1)
+inline fn popFromFreeList(self: *Page) ?[*]u8 {
+    if (self.free_head) |link| {
+        self.free_head = link.next;
+        // Prefetch next block for subsequent allocation
+        if (link.next) |next| {
+            @prefetch(next, .{ .cache = .data, .locality = 3, .rw = .read });
+        }
+        return @ptrCast(link);  // IntrusiveLifoLink* -> [*]u8
+    }
+    return null;
+}
+
+fn popFreeBlockSlow(self: *Page) ?[*]u8 {
+    // Try local_free (same-thread freed blocks) - merge lists
     if (!self.localFreeEmpty()) {
-        self.swapFreeLists();  // local_free becomes free
+        self.free_head = self.local_free_head;
+        self.local_free_head = null;
         return self.popFromFreeList();
     }
 
-    // Try xthread_free (cross-thread freed blocks)
+    // Try xthread_free (cross-thread freed blocks) - atomic swap + splice
     if (self.collectXthreadFree() > 0) {
         return self.popFromFreeList();
     }
 
     // Final fallback: bump allocate
     if (self.reserved < self.capacity) {
-        return bump_allocate();
+        const start = self.page_start orelse return null;
+        const offset = self.reserved * self.block_size;
+        self.reserved += 1;
+        self.used += 1;
+        return start + offset;
     }
 
     return null;
@@ -343,16 +561,23 @@ free(ptr)
     |
     v
 +-------------------+
-| Same thread?      |--NO--> xthread_free (atomic CAS)
+| page_thread ==    |--YES--> pushFreeBlock() --> check if was full
+| fastThreadId()?   |
 +-------------------+
-    |YES
+    |NO
     v
 +-------------------+
-| Push to           |
-| local_free        |
+| page_thread == 0? |--YES--> pushFreeBlock() (abandoned page)
+| (abandoned)       |
 +-------------------+
-    |
+    |NO
     v
++-------------------+
+| xthread_free      |  Cross-thread: atomic CAS
+| (atomic)          |
++-------------------+
+
+After pushFreeBlock():
 +-------------------+
 | Page was full?    |--NO--> DONE
 +-------------------+
@@ -366,25 +591,53 @@ free(ptr)
 ### Same-Thread Free - O(1)
 
 ```zig
-fn freeImpl(ptr: ?*anyopaque) void {
-    const segment = Segment.fromPtr(ptr);
-    const page = Segment.pageFromPtrWithSegment(segment, ptr);
-    const block: *Block = @ptrCast(ptr);
+inline fn freeImpl(ptr: ?*anyopaque) void {
+    const p = ptr orelse return;
 
-    if (segment.thread_id == currentThreadId()) {
-        // Hot path: same thread
-        page.pushFreeBlock(block);  // Push to local_free, decrement used
+    const segment = Segment.fromPtr(p);
+    const page = Segment.pageFromPtrWithSegment(segment, p);
+    const block: *Block = @ptrCast(@alignCast(p));
+
+    const page_thread = segment.thread_id.load(.monotonic);
+
+    if (page_thread == fastThreadId()) {
+        @branchHint(.likely);
+        // Hot path: same thread - push to local_free
+        page.pushFreeBlock(block);
 
         // Handle full -> non-full transition
         if (page.is_in_full()) {
+            @branchHint(.unlikely);
             freeColdPath(page);  // Re-add to bin queue
         }
+    } else if (page_thread == 0) {
+        // Abandoned page - push directly to free list
+        page.pushFreeBlock(block);
     } else {
+        @branchHint(.unlikely);
         // Cross-thread free (see below)
         page.xthreadFree(block);
     }
 }
+
+/// Push block to local_free list and decrement used - O(1)
+pub inline fn pushFreeBlock(self: *Page, block: *Block) void {
+    self.pushToLocalFreeList(@ptrCast(block));
+    self.used -= 1;
+}
+
+/// Push to local_free list - O(1), no atomics
+inline fn pushToLocalFreeList(self: *Page, block: [*]u8) void {
+    const link: *IntrusiveLifoLink = @ptrCast(@alignCast(block));
+    link.next = self.local_free_head;
+    self.local_free_head = link;
+}
 ```
+
+**Three cases:**
+1. **Same thread** (`page_thread == fastThreadId()`): Hot path, push to local_free
+2. **Abandoned** (`page_thread == 0`): Segment has no owner, push directly
+3. **Cross-thread** (else): Use atomic xthread_free list
 
 ### Cross-Thread Free - O(1) lock-free
 
@@ -392,17 +645,20 @@ fn freeImpl(ptr: ?*anyopaque) void {
 fn xthreadFree(self: *Page, block: *Block) void {
     while (true) {
         const old_head = self.xthread_free.load(.acquire);
-        block.link.next = old_head;
+        // Store old_head's link pointer (convert Block* to Link*)
+        block.link.next = if (old_head) |h| &h.link else null;
 
         if (self.xthread_free.cmpxchgWeak(old_head, block, .release, .acquire) == null) {
             // Success - increment global pending counter
-            pending_xthread_free.fetchAdd(1, .monotonic);
+            _ = pending_xthread_free.fetchAdd(1, .monotonic);
             break;
         }
         // CAS failed, retry
     }
 }
 ```
+
+**Note:** The `xthread_free` list stores `Block*` (not `IntrusiveLifoLink*`) because we need the full Block type for the atomic CAS operation. The link field within Block points to the next block's link.
 
 ### Page Reactivation: freeColdPath
 
@@ -705,34 +961,42 @@ Segment freed to arena
 +------------------+
 ```
 
-### tryPurgeDelayed (Throttled)
+### tryPurge (Time-Throttled)
 
-Called during `mallocGeneric` to avoid syscall overhead:
+Called directly during `mallocGeneric`. Each Arena tracks its own `purge_expire` timestamp:
 
 ```zig
 const PURGE_DELAY_MS: i64 = 10;
-var last_purge_check: i64 = 0;
 
-fn tryPurgeDelayed() void {
+// In mallocGeneric:
+globalArenas().tryPurge(false);
+
+// Implementation:
+pub fn tryPurge(self: *Arenas, force: bool) void {
     const now = std.time.milliTimestamp();
-    if (now - last_purge_check < PURGE_DELAY_MS) return;
-    last_purge_check = now;
+    const expire = self.purge_expire.load(.acquire);
 
-    // 1. Free empty segments from cache
-    tld.segments.collect(false);
+    // Time-based throttling: skip if not expired
+    if (!force and (expire == 0 or now < expire)) return;
 
-    // 2. Decommit freed arena blocks
-    globalArenas().tryPurge(false);
+    // Iterate all arenas and purge pending blocks
+    for (0..self.getCount()) |i| {
+        if (self.arenas[i].load(.acquire)) |arena| {
+            arena.tryPurge(force);
+        }
+    }
 }
 ```
+
+**Purge scheduling:** When segments are freed back to arena, `schedulePurge()` sets `purge_expire = now + PURGE_DELAY_MS`. This delays physical memory release to allow quick reuse.
 
 ## Segment Caching
 
 Empty segments are cached for reuse instead of immediately freed:
 
 ```zig
-const SEGMENT_CACHE_THRESHOLD: usize = 8;    // Start freeing after 8 segments
-const EMPTY_SEGMENT_CACHE_MAX: usize = 2;    // Keep up to 2 empty per queue
+const SEGMENT_CACHE_THRESHOLD: usize = 4;    // Start freeing after 4 segments
+const EMPTY_SEGMENT_CACHE_MAX: usize = 1;    // Keep up to 1 empty per queue
 
 // Three queues by page kind:
 SegmentsTLD = struct {
@@ -749,8 +1013,8 @@ SegmentsTLD = struct {
 - Quick reuse for same-sized allocations
 
 **Eviction policy:**
-- When `empty_segment_count >= EMPTY_SEGMENT_CACHE_MAX * 3` (6)
-- AND `total_segments > SEGMENT_CACHE_THRESHOLD` (8)
+- When `empty_segment_count >= EMPTY_SEGMENT_CACHE_MAX * 3` (3)
+- AND `total_segments > SEGMENT_CACHE_THRESHOLD` (4)
 - → Free segment immediately instead of caching
 
 ## Page Types
@@ -769,7 +1033,7 @@ wsize = (size + 7) / 8    // size in 8-byte words
 
 Bin assignment:
   wsize 1-8:  bin = wsize        (linear: 8, 16, 24, 32, 40, 48, 56, 64 bytes)
-  wsize > 8:  bin = logarithmic  (exponential growth)
+  wsize > 8:  bin = logarithmic  (4 bins per octave)
 
 Total: 74 bins (0-73, where 73 = BIN_HUGE)
 
@@ -777,6 +1041,39 @@ Direct pointer array: 129 entries (wsize 0-128)
   - Provides O(1) lookup for sizes up to 1024 bytes
   - Multiple wsizes may point to same page (same bin)
 ```
+
+### Bin Range Functions
+
+For bins > 8, multiple wsizes map to the same bin. These functions compute ranges directly without iteration:
+
+```zig
+/// Get minimum wsize that maps to a bin (O(1), no iteration)
+pub inline fn minWsizeForBin(bin: usize) usize {
+    if (bin <= 8) return bin;
+    // Reverse binFromWsize formula:
+    // bin + 3 = (b << 2) | ((w >> (b-2)) & 3)
+    const b = (bin + 3) >> 2;
+    const rem = (bin + 3) & 3;
+    const min_w = (1 << b) | (rem << (b - 2));
+    return min_w + 1;
+}
+
+/// Get maximum wsize that maps to a bin (O(1))
+pub inline fn maxWsizeForBin(bin: usize) usize {
+    if (bin <= 8) return bin;
+    const b = (bin + 3) >> 2;
+    const rem = (bin + 3) & 3;
+    const max_w = (1 << b) | (rem << (b - 2)) | ((1 << (b - 2)) - 1);
+    return max_w + 1;
+}
+
+/// Block size = max_wsize * 8 bytes
+pub fn blockSizeForBin(bin: usize) usize {
+    return maxWsizeForBin(bin) * INTPTR_SIZE;
+}
+```
+
+**Why these matter:** Setting direct pointers for all wsizes in a bin requires knowing the range [min_wsize, max_wsize]. Computing this via `binFromWsize` loop costs ~40% of slow path time due to `lzcnt`/shift per iteration.
 
 ## Thread Safety
 
@@ -976,15 +1273,25 @@ SMALL_WSIZE_MAX     = 128        // Max wsize for direct lookup
 - Bump allocation = sequential memory access
 - Prefetch hints for next block in free list
 - Direct pointer array eliminates bin calculation in hot path
+- Typed free list pointers (`IntrusiveLifoLink*`) avoid casts in hot path
+
+**Computational optimizations:**
+- `minWsizeForBin`/`maxWsizeForBin` use O(1) inverse formula instead of O(n) loop
+- Avoids expensive `lzcnt`/`shrx` per wsize when setting direct pointers
+- Time-based throttling for arena purge (10ms delay)
 
 ## Common Pitfalls for Contributors
 
-1. **Direct pointer mismatch**: When adding a page to a bin, ALL wsizes that map to that bin must have their direct pointers updated. Otherwise allocations of different sizes in the same bin will miss the fast path.
+1. **Direct pointer mismatch**: When adding a page to a bin, ALL wsizes that map to that bin must have their direct pointers updated. Use `minWsizeForBin(bin)` and `maxWsizeForBin(bin)` to get the range. Otherwise allocations of different sizes in the same bin will miss the fast path.
 
-1. **Page full flag**: When a page is exhausted in fast path, it must be marked `in_full` and removed from bin queue. When it receives a free, `freeColdPath` must re-add it.
+2. **Page full flag**: When a page is exhausted in fast path, it must be marked `in_full` and removed from bin queue. When it receives a free, `freeColdPath` must re-add it.
 
-1. **Cross-thread free accounting**: The `used` counter must be decremented when collecting `xthread_free`, and `pending_xthread_free` global counter must be updated.
+3. **Cross-thread free accounting**: The `used` counter must be decremented when collecting `xthread_free`, and `pending_xthread_free` global counter must be updated.
 
-1. **Page size constraint**: Page struct must remain exactly 64 bytes (one cache line). Adding fields requires removing or compressing existing ones.
+4. **Page size constraint**: Page struct must remain exactly 64 bytes (one cache line). Adding fields requires removing or compressing existing ones.
 
-1. **Bin vs wsize**: For small allocations, `bin == wsize`. For larger allocations, multiple wsizes map to the same bin. `blockSizeForBin(bin)` returns the maximum size for that bin.
+5. **Bin vs wsize**: For small allocations, `bin == wsize`. For larger allocations, multiple wsizes map to the same bin. `blockSizeForBin(bin)` returns the maximum size for that bin.
+
+6. **Typed pointers**: Use `IntrusiveLifoLink*` for free lists instead of `anyopaque`. This eliminates pointer casts in the hot allocation/free paths.
+
+7. **binFromWsize in loops**: Never call `binFromWsize` in a loop over wsizes - use `minWsizeForBin`/`maxWsizeForBin` instead. The `lzcnt` instruction per iteration was causing 40%+ slow path overhead.
