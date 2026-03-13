@@ -42,6 +42,7 @@ const os = @import("os.zig");
 const page_size_min = os.mem_config_static.page_size;
 const utils = @import("util.zig");
 const assert = utils.assert;
+const types = @import("types.zig");
 
 /// OS-backed memory allocator
 ///
@@ -63,6 +64,26 @@ pub fn allocator(self: *OsAllocator) Allocator {
     };
 }
 
+// Hhinting is disabled on operating systems that make an effort to not reuse
+/// mappings. For example, OpenBSD aggressively randomizes addresses of mappings
+/// that don't provide a hint (for security reasons, but it serves our needs
+/// too).
+const enable_hints = switch (builtin.target.os.tag) {
+    .openbsd => false,
+    else => true,
+};
+
+/// When hinting upwards, this points to the next page that we hope to allocate
+/// at; when hinting downwards, this points to the beginning of the last
+/// successful allocation.
+///
+var addr_hint: ?[*]align(page_size_min) u8 = null;
+
+pub const StackGrowth = enum {
+    down,
+    up,
+};
+
 pub inline fn map(self: *const OsAllocator, n: usize, alignment: mem.Alignment) ?[*]u8 {
     const page_size = self.config.page_size;
     if (n >= maxInt(usize) - page_size) {
@@ -75,8 +96,22 @@ pub inline fn map(self: *const OsAllocator, n: usize, alignment: mem.Alignment) 
 
     const max_drop_len = alignment_bytes -| page_size;
     const overalloc_len = aligned_len + max_drop_len;
-    const maybe_unaligned_hint = @atomicLoad(@TypeOf(std.heap.next_mmap_addr_hint), &std.heap.next_mmap_addr_hint, .monotonic);
-    const hint: ?[*]align(page_size_min) u8 = @ptrFromInt(((@intFromPtr(maybe_unaligned_hint)) +% (alignment_bytes - 1)) & ~(alignment_bytes - 1));
+
+    const maybe_unaligned_hint, const hint = blk: {
+        if (!enable_hints) break :blk .{ null, null };
+
+        const maybe_unaligned_hint = @atomicLoad(@TypeOf(addr_hint), &addr_hint, .unordered);
+
+        // For the very first mmap, let the kernel pick a good starting address;
+        // we'll begin doing our hinting from there.
+        if (maybe_unaligned_hint == null) break :blk .{ null, null };
+
+        // Aligning hint does not use mem.alignPointer, because it is slow.
+        // Aligning hint does not use mem.alignForward, because it asserts that there will be no overflow.
+        const hint: ?[*]align(page_size_min) u8 = @ptrFromInt(((@intFromPtr(maybe_unaligned_hint) -% aligned_len) & ~(alignment_bytes - 1)) -% max_drop_len);
+
+        break :blk .{ maybe_unaligned_hint, hint };
+    };
 
     const slice = posix.mmap(
         hint,
@@ -102,13 +137,9 @@ pub inline fn map(self: *const OsAllocator, n: usize, alignment: mem.Alignment) 
     };
 
     //does not enable for always hugepages,use only when madvise specified
-    if (self.config.thp == .thp_mode_always) {
+    if (self.config.thp == .thp_mode_always and (aligned_len >= 2 * types.MiB)) {
         os.maybe_enable_thp(result_ptr, aligned_len, alignment_bytes, self.config.thp);
     }
-    // if (self.config.thp == .thp_mode_always) {
-    //     @branchHint(.likely);
-    //     os.maybe_enable_thp(result_ptr, aligned_len, alignment_bytes, self.config.thp);
-    // }
     // Unmap the extra bytes that were only requested in order to guarantee
     // that the range of memory we were provided had a proper alignment in it
     // somewhere. The extra bytes could be at the beginning, or end, or both.
@@ -116,8 +147,11 @@ pub inline fn map(self: *const OsAllocator, n: usize, alignment: mem.Alignment) 
     if (drop_len != 0) posix.munmap(slice[0..drop_len]);
     const remaining_len = overalloc_len - drop_len;
     if (remaining_len > aligned_len) posix.munmap(@alignCast(result_ptr[aligned_len..remaining_len]));
-    const new_hint: [*]align(page_size_min) u8 = @alignCast(result_ptr + aligned_len);
-    _ = @cmpxchgStrong(@TypeOf(std.heap.next_mmap_addr_hint), &std.heap.next_mmap_addr_hint, maybe_unaligned_hint, new_hint, .monotonic, .monotonic);
+
+    if (enable_hints) {
+        const new_hint: [*]align(page_size_min) u8 = @alignCast(result_ptr);
+        _ = @cmpxchgStrong(@TypeOf(addr_hint), &addr_hint, maybe_unaligned_hint, new_hint, .monotonic, .monotonic);
+    }
     return result_ptr;
 }
 
