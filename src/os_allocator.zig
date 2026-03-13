@@ -22,7 +22,7 @@
 //!
 //! ## Address Hint Management
 //!
-//! Maintains `std.heap.next_mmap_addr_hint` for address locality.
+//! Maintains `addr_hint` for address locality.
 //! Sequential allocations tend to be placed near each other,
 //! improving cache behavior and reducing TLB pressure.
 //!
@@ -209,7 +209,7 @@ pub inline fn realloc(self: *const OsAllocator, uncasted_memory: []u8, new_len: 
     }
 
     if (posix.MREMAP != void) {
-        const old_hint = @atomicLoad(@TypeOf(std.heap.next_mmap_addr_hint), &std.heap.next_mmap_addr_hint, .monotonic);
+        const old_hint = @atomicLoad(@TypeOf(addr_hint), &addr_hint, .monotonic);
 
         const new_memory = posix.mremap(memory.ptr, memory.len, new_len, .{ .MAYMOVE = may_move }, null) catch return null;
         if (new_memory.ptr != memory.ptr) {
@@ -222,8 +222,8 @@ pub inline fn realloc(self: *const OsAllocator, uncasted_memory: []u8, new_len: 
                 if (hint_addr >= new_start_addr and hint_addr < new_end_addr) {
                     const updated_hint: [*]align(page_size_min) u8 = @alignCast(new_end);
                     _ = @cmpxchgStrong(
-                        @TypeOf(std.heap.next_mmap_addr_hint),
-                        &std.heap.next_mmap_addr_hint,
+                        @TypeOf(addr_hint),
+                        &addr_hint,
                         old_hint,
                         updated_hint,
                         .monotonic,
@@ -240,15 +240,15 @@ pub inline fn realloc(self: *const OsAllocator, uncasted_memory: []u8, new_len: 
         const shrink_start = memory.ptr + new_page_len;
         const shrink_len = old_page_len - new_page_len;
 
-        const old_hint = @atomicLoad(@TypeOf(std.heap.next_mmap_addr_hint), &std.heap.next_mmap_addr_hint, .unordered);
+        const old_hint = @atomicLoad(@TypeOf(addr_hint), &addr_hint, .unordered);
         if (old_hint) |hint_ptr| {
             const hint_addr = @intFromPtr(hint_ptr);
             const shrink_start_addr = @intFromPtr(shrink_start);
             if (hint_addr >= shrink_start_addr) {
                 const safe_hint: [*]align(page_size_min) u8 = @ptrCast(memory.ptr);
                 _ = @cmpxchgStrong(
-                    @TypeOf(std.heap.next_mmap_addr_hint),
-                    &std.heap.next_mmap_addr_hint,
+                    @TypeOf(addr_hint),
+                    &addr_hint,
                     old_hint,
                     safe_hint,
                     .monotonic,
