@@ -777,7 +777,7 @@ free(ptr)
     | tryPurge()
     v
 +------------------+
-| MADV_FREE        |  Physical pages released to OS
+| MADV_DONTNEED    |  Physical pages released to OS
 +------------------+
 ```
 
@@ -837,7 +837,7 @@ fn freeSegment(self: *SegmentsTLD, segment: *Segment, force: bool) void {
     self.removeFromFreeQueue(segment);
     self.all_segments.remove(segment);
 
-    // Purge uncommitted pages (MADV_FREE)
+    // Purge uncommitted pages (MADV_DONTNEED)
     if (force and !segment.memid.flags.is_pinned) {
         for (segment.pages[0..segment.capacity]) |*pg| {
             if (!pg.is_segment_in_use() and pg.is_commited()) {
@@ -870,39 +870,21 @@ fn pagePurge(self: *Segment, pg: *Page) void {
     if (!pg.is_commited()) return;
 
     const start = self.rawPageStart(pg, &psize);
-
-    // MADV_FREE: Mark pages as reusable
-    // Kernel can reclaim physical memory when needed
-    // Faster than MADV_DONTNEED (lazy decommit)
-    std.posix.madvise(start, psize, MADV.FREE);
+    // Free NOW!
+    std.posix.madvise(start, psize, MADV.DONTNEED);
     pg.set_commited(false);
 }
 ```
 
 ## OS Memory Operations
 
-| Operation | Syscall | Effect |
-|-----------|---------|--------|
-| **commit** | `mprotect(RW)` | Make memory accessible |
-| **decommit** | `madvise(MADV_DONTNEED)` | Release physical pages immediately |
-| **purge/reset** | `madvise(MADV_FREE)` | Mark pages as reusable (lazy free) |
-| **protect** | `mprotect(NONE)` | Make memory inaccessible (guard pages) |
+| Operation       | Syscall                  | Effect                                 |
+| --------------- | ------------------------ | -------------------------------------- |
+| **commit**      | `mprotect(RW)`           | Make memory accessible                 |
+| **decommit**    | `madvise(MADV_DONTNEED)` | Release physical pages immediately     |
+| **purge/reset** | `madvise(MADV_DONTNEED)` | Mark pages as reusable (lazy free)     |
+| **protect**     | `mprotect(NONE)`         | Make memory inaccessible (guard pages) |
 
-### MADV_FREE vs MADV_DONTNEED
-
-```
-MADV_FREE (preferred):
-  - Lazy decommit: kernel reclaims when under memory pressure
-  - If memory accessed before reclaim: data preserved (no page fault)
-  - Lower syscall overhead
-  - Used for page purge
-
-MADV_DONTNEED:
-  - Immediate decommit: RSS decreases immediately
-  - Next access causes page fault + zero-fill
-  - Used for arena block decommit
-  - Fallback if MADV_FREE not supported
-```
 
 ### Fallback Mechanism
 

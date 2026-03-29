@@ -317,7 +317,7 @@ pub const Segment = struct {
         const start = self.rawPageStart(pg, &psize);
 
         const ptr: [*]align(std.heap.page_size_min) u8 = @alignCast(start);
-        std.posix.madvise(ptr, psize, std.posix.MADV.FREE) catch {};
+        std.posix.madvise(ptr, psize, std.posix.MADV.DONTNEED) catch {};
         pg.set_commited(false);
     }
 
@@ -1211,7 +1211,7 @@ pub const SegmentsTLD = struct {
 
         // Use madvise to reset memory
         const ptr: [*]align(std.heap.page_size_min) u8 = @alignCast(start);
-        std.posix.madvise(ptr, psize, std.posix.MADV.FREE) catch {};
+        std.posix.madvise(ptr, psize, std.posix.MADV.DONTNEED) catch {};
         pg.set_zero_init(true);
     }
 
