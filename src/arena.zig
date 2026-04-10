@@ -52,7 +52,7 @@ const Atomic = std.atomic.Value;
 const Allocator = std.mem.Allocator;
 
 /// Maximum number of arenas that can be registered
-pub const MAX_ARENAS: usize = 256;
+pub const MAX_ARENAS: usize = 128;
 pub const ARENA_BLOCK_SIZE: usize = types.SEGMENT_SIZE; // 32 MiB
 pub const ARENA_MIN_OBJ_SIZE: usize = ARENA_BLOCK_SIZE / 2; // 16 MiB minimum for arena alloc
 
