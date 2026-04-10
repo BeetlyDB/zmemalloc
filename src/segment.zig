@@ -862,8 +862,15 @@ pub const SegmentsTLD = struct {
             if (force) {
                 // Only free segment if explicitly forced
                 self.freeSegment(segment, true);
-            } else if (self.empty_segment_count >= EMPTY_SEGMENT_CACHE_MAX * 3 and self.count > SEGMENT_CACHE_THRESHOLD) {
-                // Too many empty segments cached, free this one immediately
+            } else if (self.empty_segment_count >= EMPTY_SEGMENT_CACHE_MAX or self.count > SEGMENT_CACHE_THRESHOLD) {
+                // Either cache is already at/above its limit, or we've hit
+                // the total segment threshold. Free immediately to return
+                // memory to the arena (which will purge after PURGE_DELAY_MS).
+                //
+                // Previously this used `EMPTY_SEGMENT_CACHE_MAX * 3` AND
+                // required `count > SEGMENT_CACHE_THRESHOLD`, which allowed
+                // up to 3 empty segments (96 MiB) to sit cached forever in
+                // cross-thread workloads where producer pages drain slowly.
                 self.freeSegment(segment, true);
             } else {
                 // Cache empty segment for reuse

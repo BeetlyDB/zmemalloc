@@ -367,10 +367,6 @@ inline fn setDirectPointerForBlockSize(heap: *Heap, page: *Page) void {
 inline fn mallocGeneric(heap: *Heap, size: usize, zero: bool) ?[*]u8 {
     const t = heap.tld orelse return null;
 
-    // Check for pending arena purges (mimalloc-style deferred decommit)
-    // Arena's tryPurge has its own time-based throttling via purge_expire
-    arena_mod.globalArenas().tryPurge(false);
-
     // Round up to bin's block size - this allows page reuse across similar sizes
     const bin = page_mod.binFromSize(size);
     // For huge allocations (> LARGE_OBJ_SIZE_MAX), use the requested size directly
@@ -749,9 +745,13 @@ pub const ZMemAllocator = struct {
 const MAX_FAST_SIZE: usize = types.SMALL_WSIZE_MAX * types.INTPTR_SIZE;
 
 /// Periodic maintenance - reclaims cross-thread freed blocks that accumulated
-/// on "full" pages (pages removed from the bin queue). Without this, full
-/// pages never get their xthread_free lists collected during normal allocation
-/// and memory grows unboundedly in producer-consumer workloads.
+/// on "full" pages (pages removed from the bin queue) AND drives deferred
+/// arena decommits. Without this, full pages never get their xthread_free
+/// lists collected during normal allocation and memory grows unboundedly in
+/// producer-consumer workloads. And without the tryPurge call, segments that
+/// are returned to the arena stay committed (RSS high) as long as the
+/// producer stays in the fast path (mallocGeneric is where arena tryPurge
+/// would otherwise run).
 ///
 /// Marked noinline to keep the hot malloc path compact.
 noinline fn doPeriodicMaintenance(heap: *Heap) void {
@@ -762,6 +762,10 @@ noinline fn doPeriodicMaintenance(heap: *Heap) void {
             _ = reclaimFullPages(t, heap);
         }
     }
+    // Always drive arena purges (cheap — time-gated via purge_expire).
+    // This is the only place the purge runs for workloads that never hit
+    // the slow allocation path.
+    arena_mod.globalArenas().tryPurge(false);
 }
 
 /// Slow path when fast allocation fails - noinline to reduce register pressure in malloc
