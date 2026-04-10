@@ -520,17 +520,24 @@ inline fn fastThreadId() usize {
 /// `freeSegment` (and thus remove `seg` from `all_segments` and return its
 /// memory to the arena) when the segment becomes empty and the cache
 /// threshold is exceeded. We must:
-///   (a) capture `seg.all_prev` BEFORE touching the segment, and
+///   (a) capture the next-link BEFORE touching the segment, and
 ///   (b) bail out of the inner page loop as soon as `seg.used` drops to 0,
 ///       because `seg`/`seg.pages[]` may have been freed by then.
+///
+/// NOTE on iteration direction: `AllSegmentsList` is built with
+/// `field_back=.all_next, field_next=.all_prev`. To walk from tail toward
+/// head we MUST follow `all_next` (this is what `DoublyLinkedList.contains`
+/// does). Using `all_prev` only visits the tail segment and strands every
+/// older segment's xthread_free list — the root cause of unbounded memory
+/// growth in producer/consumer workloads.
 noinline fn reclaimFullPages(t: *TLD, heap: *Heap) usize {
     var reclaimed: usize = 0;
 
     // Scan all segments owned by this thread
     var segment = t.segments.all_segments.tail;
     while (segment) |seg| {
-        // Capture prev link BEFORE any mutation — `seg` may be freed below.
-        const next = seg.all_prev;
+        // Capture next link BEFORE any mutation — `seg` may be freed below.
+        const next = seg.all_next;
         const capacity = seg.capacity;
         var i: usize = 0;
         while (i < capacity) : (i += 1) {
@@ -892,11 +899,14 @@ pub fn collect(force: bool) usize {
     //
     // SAFETY: `freePage` with `force=true` will immediately free the segment
     // when it becomes empty, invalidating `seg` and its pages array. Capture
-    // the prev link up-front and bail out of the inner loop when the segment
+    // the next link up-front and bail out of the inner loop when the segment
     // was released.
+    //
+    // NOTE: walk tail→head via `all_next` (see reclaimFullPages for the
+    // detailed explanation of the list field naming).
     var segment = tld.segments.all_segments.tail;
     while (segment) |seg| {
-        const next_seg = seg.all_prev;
+        const next_seg = seg.all_next;
         const capacity = seg.capacity;
         var pages_freed: usize = 0;
         var i: usize = 0;

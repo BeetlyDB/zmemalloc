@@ -1136,9 +1136,16 @@ pub const SegmentsTLD = struct {
     pub fn collectAllXthreadFree(self: *Self) usize {
         var total_collected: usize = 0;
 
+        // NOTE: `all_segments` is built with field_back=.all_next,
+        // field_next=.all_prev (see AllSegmentsList above). Iteration from
+        // `tail` toward `head` MUST follow `all_next` — following `all_prev`
+        // only visits the tail (tail.all_prev is always null), silently
+        // stranding every older segment's xthread_free list. This was the
+        // root cause of unbounded memory growth in producer/consumer
+        // workloads.
         var segment = self.all_segments.tail;
         while (segment) |seg| {
-            const next = seg.all_prev;
+            const next = seg.all_next;
 
             for (0..seg.capacity) |i| {
                 const pg = &seg.pages[i];
