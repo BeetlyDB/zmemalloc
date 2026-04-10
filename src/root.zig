@@ -135,7 +135,6 @@ threadlocal var cached_thread_id: usize = 0;
 /// full pages.
 threadlocal var alloc_count: usize = 0;
 
-
 // =============================================================================
 // Thread-Local Initialization
 // =============================================================================
@@ -355,7 +354,6 @@ inline fn setDirectPointerForBlockSize(heap: *Heap, page: *Page) void {
 // Memory Maintenance (Background Tasks)
 // =============================================================================
 
-
 /// **Slow Path**: Full allocation logic when fast/medium paths fail
 ///
 /// This handles:
@@ -368,15 +366,6 @@ inline fn setDirectPointerForBlockSize(heap: *Heap, page: *Page) void {
 /// This is the most expensive path but handles all edge cases.
 inline fn mallocGeneric(heap: *Heap, size: usize, zero: bool) ?[*]u8 {
     const t = heap.tld orelse return null;
-
-    // Collect cross-thread frees when too many are pending
-    // This prevents memory from being "stuck" in full pages
-    const pending = page_mod.pending_xthread_free.load(.monotonic);
-    if (pending > XTHREAD_COLLECT_THRESHOLD) {
-        @branchHint(.unlikely);
-        _ = t.segments.collectAllXthreadFree();
-        _ = reclaimFullPages(t, heap);
-    }
 
     // Check for pending arena purges (mimalloc-style deferred decommit)
     // Arena's tryPurge has its own time-based throttling via purge_expire
@@ -526,40 +515,57 @@ inline fn fastThreadId() usize {
 /// - Re-adds non-empty pages to bin queue
 ///
 /// Returns: Number of pages reclaimed/reactivated
-inline fn reclaimFullPages(t: *TLD, heap: *Heap) usize {
+///
+/// SAFETY: Iterator invalidation — `freePage(pg, false)` can trigger
+/// `freeSegment` (and thus remove `seg` from `all_segments` and return its
+/// memory to the arena) when the segment becomes empty and the cache
+/// threshold is exceeded. We must:
+///   (a) capture `seg.all_prev` BEFORE touching the segment, and
+///   (b) bail out of the inner page loop as soon as `seg.used` drops to 0,
+///       because `seg`/`seg.pages[]` may have been freed by then.
+noinline fn reclaimFullPages(t: *TLD, heap: *Heap) usize {
     var reclaimed: usize = 0;
 
     // Scan all segments owned by this thread
     var segment = t.segments.all_segments.tail;
     while (segment) |seg| {
+        // Capture prev link BEFORE any mutation — `seg` may be freed below.
         const next = seg.all_prev;
-        for (0..seg.capacity) |i| {
+        const capacity = seg.capacity;
+        var i: usize = 0;
+        while (i < capacity) : (i += 1) {
             const pg = &seg.pages[i];
-            if (pg.is_segment_in_use()) {
-                // Collect cross-thread frees
-                if (pg.xthread_free.load(.monotonic) != null) {
-                    _ = pg.collectXthreadFree();
-                }
+            if (!pg.is_segment_in_use()) continue;
 
-                // Free empty pages
-                if (pg.used == 0 and pg.capacity > 0) {
-                    if (pg.is_in_bin()) {
-                        const bin = page_mod.binFromSize(pg.block_size);
-                        pg.pageRemoveFromBin(heap, bin);
-                    }
-                    clearDirectPointersForPage(heap, pg);
-                    pg.set_in_full(false);
-                    t.segments.freePage(pg, false);
-                    reclaimed += 1;
-                } else if (pg.is_in_full() and pg.hasFree()) {
-                    // Reactivate full page that now has space
-                    pg.set_in_full(false);
+            // Collect cross-thread frees
+            if (pg.xthread_free.load(.monotonic) != null) {
+                _ = pg.collectXthreadFree();
+            }
+
+            // Free empty pages
+            if (pg.used == 0 and pg.capacity > 0) {
+                if (pg.is_in_bin()) {
                     const bin = page_mod.binFromSize(pg.block_size);
-                    if (bin < heap.pages.len and !pg.is_in_bin()) {
-                        pg.pagePushBin(heap, bin);
-                    }
-                    reclaimed += 1;
+                    pg.pageRemoveFromBin(heap, bin);
                 }
+                clearDirectPointersForPage(heap, pg);
+                pg.set_in_full(false);
+
+                // If this was the last used page in the segment, freePage may
+                // release the entire segment, invalidating `seg` and all
+                // `seg.pages[i]`. Bail out of the inner loop in that case.
+                const was_last = seg.used == 1;
+                t.segments.freePage(pg, false);
+                reclaimed += 1;
+                if (was_last) break;
+            } else if (pg.is_in_full() and pg.hasFree()) {
+                // Reactivate full page that now has space
+                pg.set_in_full(false);
+                const bin = page_mod.binFromSize(pg.block_size);
+                if (bin < heap.pages.len and !pg.is_in_bin()) {
+                    pg.pagePushBin(heap, bin);
+                }
+                reclaimed += 1;
             }
         }
         segment = next;
@@ -641,8 +647,6 @@ inline fn freeImpl(ptr: ?*anyopaque) void {
         page.pushFreeBlock(block);
     } else {
         @branchHint(.unlikely);
-        // Cross-thread free: use xthread_free
-        // Note: delayed_free approach has thread-lifetime issues (crash when owner thread exits)
         // TODO: implement safe delayed_free with reference counting or hazard pointers
         page.xthreadFree(block);
     }
@@ -885,12 +889,18 @@ pub fn collect(force: bool) usize {
 
     // Now iterate ALL segments and free empty pages
     // This handles pages that were in_full but became empty after xthread_free collection
+    //
+    // SAFETY: `freePage` with `force=true` will immediately free the segment
+    // when it becomes empty, invalidating `seg` and its pages array. Capture
+    // the prev link up-front and bail out of the inner loop when the segment
+    // was released.
     var segment = tld.segments.all_segments.tail;
     while (segment) |seg| {
         const next_seg = seg.all_prev;
+        const capacity = seg.capacity;
         var pages_freed: usize = 0;
-
-        for (0..seg.capacity) |i| {
+        var i: usize = 0;
+        while (i < capacity) : (i += 1) {
             const pg = &seg.pages[i];
             if (pg.is_segment_in_use() and pg.used == 0 and pg.capacity > 0) {
                 // Page is empty - free it
@@ -900,8 +910,10 @@ pub fn collect(force: bool) usize {
                 }
                 clearDirectPointersForPage(heap, pg);
                 pg.set_in_full(false);
+                const was_last = seg.used == 1;
                 tld.segments.freePage(pg, force);
                 pages_freed += 1;
+                if (was_last) break; // `seg` may now be freed memory
             }
         }
         collected += pages_freed;

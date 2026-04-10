@@ -902,7 +902,7 @@ pub const SegmentsTLD = struct {
         return null;
     }
 
-    inline fn allocPageInKind(
+    fn allocPageInKind(
         self: *Self,
         block_size: usize,
         kind: Segment.PageKind,
@@ -1007,7 +1007,7 @@ pub const SegmentsTLD = struct {
     }
 
     /// Main entry point for page allocation
-    pub inline fn allocPage(self: *Self, block_size: usize) ?*Page {
+    pub fn allocPage(self: *Self, block_size: usize) ?*Page {
         if (block_size <= types.SMALL_OBJ_SIZE_MAX) {
             return self.allocSmallPage(block_size);
         } else if (block_size <= types.MEDIUM_OBJ_SIZE_MAX) {
