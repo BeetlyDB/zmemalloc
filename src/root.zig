@@ -82,7 +82,17 @@ const ABANDON_RECLAIM_LIMIT: usize = 16;
 
 /// Trigger full page scan when this many cross-thread frees are pending
 /// Higher = less scanning overhead, but more memory retention
-const XTHREAD_COLLECT_THRESHOLD: usize = 4096;
+const XTHREAD_COLLECT_THRESHOLD: usize = 1024;
+
+/// Lower threshold for periodic maintenance (checked every N allocs)
+/// Catches accumulated xthread_free before mallocGeneric is reached
+const XTHREAD_PERIODIC_THRESHOLD: usize = 256;
+
+/// Periodic maintenance is triggered every 2^PERIODIC_MAINT_SHIFT allocations.
+/// 8 => every 256 allocations. Keeps the hot path cheap while still bounding
+/// how long cross-thread freed blocks can sit on "full" pages.
+const PERIODIC_MAINT_SHIFT: u6 = 8;
+const PERIODIC_MAINT_MASK: usize = (@as(usize, 1) << PERIODIC_MAINT_SHIFT) - 1;
 
 // =============================================================================
 // Global State (Process-wide, shared across all threads)
@@ -118,6 +128,12 @@ threadlocal var cached_heap: ?*Heap = null;
 
 /// Cached thread ID (TLD address) for fast same-thread check in free()
 threadlocal var cached_thread_id: usize = 0;
+
+/// Allocation counter for periodic maintenance (cross-thread free reclamation)
+/// Incremented on every malloc() call; when the low bits are zero we run
+/// `doPeriodicMaintenance` to reclaim cross-thread freed blocks stuck on
+/// full pages.
+threadlocal var alloc_count: usize = 0;
 
 
 // =============================================================================
@@ -721,6 +737,22 @@ pub const ZMemAllocator = struct {
 /// Maximum size for fast path (fits in direct page lookup)
 const MAX_FAST_SIZE: usize = types.SMALL_WSIZE_MAX * types.INTPTR_SIZE;
 
+/// Periodic maintenance - reclaims cross-thread freed blocks that accumulated
+/// on "full" pages (pages removed from the bin queue). Without this, full
+/// pages never get their xthread_free lists collected during normal allocation
+/// and memory grows unboundedly in producer-consumer workloads.
+///
+/// Marked noinline to keep the hot malloc path compact.
+noinline fn doPeriodicMaintenance(heap: *Heap) void {
+    const pending = page_mod.pending_xthread_free.load(.monotonic);
+    if (pending > XTHREAD_PERIODIC_THRESHOLD) {
+        if (heap.tld) |t| {
+            _ = t.segments.collectAllXthreadFree();
+            _ = reclaimFullPages(t, heap);
+        }
+    }
+}
+
 /// Slow path when fast allocation fails - noinline to reduce register pressure in malloc
 noinline fn mallocSlowPath(heap: *Heap, size: usize) ?[*]u8 {
     // Try medium path first (bin queue lookup)
@@ -739,6 +771,16 @@ pub fn malloc(size: usize) ?[*]u8 {
 
     // Single threadlocal read — also initializes TLD on first call
     const heap = getHeapOrInit();
+
+    // Periodic maintenance: every 256 allocations, check if there are
+    // accumulated cross-thread frees waiting on full pages and reclaim them.
+    // Without this, xthread_free lists grow unboundedly in producer-consumer
+    // workloads where fast/medium paths keep succeeding.
+    alloc_count +%= 1;
+    if (alloc_count & PERIODIC_MAINT_MASK == 0) {
+        @branchHint(.unlikely);
+        doPeriodicMaintenance(heap);
+    }
 
     // Fast path: direct page lookup for small sizes (< 1KB)
     if (size <= MAX_FAST_SIZE) {
