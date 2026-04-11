@@ -1067,28 +1067,173 @@ pub fn getAbandonedCount() usize {
     return global_subproc.abandoned_count.load(.monotonic);
 }
 
-/// Get memory statistics
-// pub fn getStats() struct {
-//     segments_count: usize,
-//     segments_size: usize,
-//     peak_segments: usize,
-//     peak_size: usize,
-// } {
-//     if (!tld_initialized) return .{
-//         .segments_count = 0,
-//         .segments_size = 0,
-//         .peak_segments = 0,
-//         .peak_size = 0,
-//     };
-//
-//     const stats = tld.segments.getStats();
-//     return .{
-//         .segments_count = stats.count,
-//         .segments_size = stats.current_size,
-//         .peak_segments = stats.peak_count,
-//         .peak_size = stats.peak_size,
-//     };
-// }
+/// Per-thread allocator statistics collected by `dumpStats`.
+pub const ThreadStats = struct {
+    thread_id: usize,
+
+    // From SegmentsTLD counters
+    segments_count: usize,
+    segments_peak_count: usize,
+    segments_current_size: usize,
+    segments_peak_size: usize,
+    reclaim_count: usize,
+    empty_segment_count: usize,
+
+    // Queue depths
+    small_free_queue_len: usize,
+    medium_free_queue_len: usize,
+    large_free_queue_len: usize,
+
+    // Per-page aggregates (walks all_segments)
+    all_segments_total: usize,
+    pages_in_use_total: usize,
+    pages_in_full_total: usize,
+    pages_in_bin_total: usize,
+    pages_with_xthread_pending_total: usize,
+    blocks_in_use_total: usize,
+    blocks_capacity_total: usize,
+};
+
+/// Global allocator statistics collected by `dumpStats`.
+pub const GlobalStats = struct {
+    active_threads: usize,
+    abandoned_segments: usize,
+    pending_xthread_free: usize,
+
+    arena_count: usize,
+    arenas_total_bytes: usize,
+    arenas_used_bytes: usize,
+    arenas_committed_bytes: usize,
+    arenas_dirty_bytes: usize,
+    arenas_purge_pending_bytes: usize,
+};
+
+fn queueLen(q: *const segment_mod.SegmentQueue) usize {
+    var n: usize = 0;
+    var cur = q.head;
+    while (cur) |s| : (cur = s.next) n += 1;
+    return n;
+}
+
+/// Collect per-thread stats for the calling thread. Returns all zero if the
+/// TLD is not yet initialized on this thread.
+pub fn getThreadStats() ThreadStats {
+    var s: ThreadStats = std.mem.zeroes(ThreadStats);
+    if (!tld_initialized) return s;
+
+    const segs = &tld.segments;
+    s.thread_id = segs.thread_id;
+    s.segments_count = segs.count;
+    s.segments_peak_count = segs.peak_count;
+    s.segments_current_size = segs.current_size;
+    s.segments_peak_size = segs.peak_size;
+    s.reclaim_count = segs.reclaim_count;
+    s.empty_segment_count = segs.empty_segment_count;
+
+    s.small_free_queue_len = queueLen(&segs.small_free);
+    s.medium_free_queue_len = queueLen(&segs.medium_free);
+    s.large_free_queue_len = queueLen(&segs.large_free);
+
+    // Walk all_segments and aggregate page state
+    var cur = segs.all_segments.tail;
+    while (cur) |seg| {
+        const next = seg.all_next;
+        s.all_segments_total += 1;
+        const cap = seg.capacity;
+        var i: usize = 0;
+        while (i < cap) : (i += 1) {
+            const pg = &seg.pages[i];
+            if (!pg.is_segment_in_use()) continue;
+            s.pages_in_use_total += 1;
+            if (pg.is_in_full()) s.pages_in_full_total += 1;
+            if (pg.is_in_bin()) s.pages_in_bin_total += 1;
+            if (pg.xthread_free.load(.monotonic) != null) {
+                s.pages_with_xthread_pending_total += 1;
+            }
+            s.blocks_in_use_total += @as(usize, pg.used);
+            s.blocks_capacity_total += @as(usize, pg.capacity);
+        }
+        cur = next;
+    }
+    return s;
+}
+
+/// Collect global (process-wide) stats.
+pub fn getGlobalStats() GlobalStats {
+    var s: GlobalStats = std.mem.zeroes(GlobalStats);
+    s.active_threads = active_thread_count.load(.monotonic);
+    s.abandoned_segments = global_subproc.abandoned_count.load(.monotonic);
+    s.pending_xthread_free = page_mod.pending_xthread_free.load(.monotonic);
+
+    const arenas = arena_mod.globalArenas();
+    const n = arenas.getCount();
+    s.arena_count = n;
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        const a = arenas.getByIndex(i) orelse continue;
+        const st = a.getStats();
+        s.arenas_total_bytes += st.totalBytes();
+        s.arenas_used_bytes += st.usedBytes();
+        s.arenas_committed_bytes += st.committedBytes();
+        s.arenas_dirty_bytes += st.dirty_blocks * arena_mod.ARENA_BLOCK_SIZE;
+        s.arenas_purge_pending_bytes += st.purge_pending * arena_mod.ARENA_BLOCK_SIZE;
+    }
+    return s;
+}
+
+/// Diagnostic dump of allocator state for the calling thread + global arenas.
+/// Writes to stderr with `tag` as a prefix so multiple dumps can be
+/// distinguished. Safe to call from any thread; per-thread section only
+/// reflects the caller's TLD.
+pub fn dumpStats(tag: []const u8) void {
+    const ts = getThreadStats();
+    const gs = getGlobalStats();
+    const MB: f64 = 1024.0 * 1024.0;
+
+    std.debug.print(
+        \\[zmemalloc:{s}] ===== thread tid=0x{x} =====
+        \\  segments     count={d} peak={d} size={d:.1}MB peak_size={d:.1}MB
+        \\  empty_cache  {d}  reclaims={d}
+        \\  free_queues  small={d} medium={d} large={d}
+        \\  all_segs     {d}
+        \\  pages        in_use={d} in_full={d} in_bin={d} xthread_pending={d}
+        \\  blocks       used={d}/{d}
+        \\[zmemalloc:{s}] ===== global =====
+        \\  threads      active={d}  abandoned_segs={d}  pending_xthread_free={d}
+        \\  arenas       count={d}
+        \\  arena_bytes  total={d:.1}MB used={d:.1}MB committed={d:.1}MB dirty={d:.1}MB purge_pending={d:.1}MB
+        \\
+    , .{
+        tag,
+        ts.thread_id,
+        ts.segments_count,
+        ts.segments_peak_count,
+        @as(f64, @floatFromInt(ts.segments_current_size)) / MB,
+        @as(f64, @floatFromInt(ts.segments_peak_size)) / MB,
+        ts.empty_segment_count,
+        ts.reclaim_count,
+        ts.small_free_queue_len,
+        ts.medium_free_queue_len,
+        ts.large_free_queue_len,
+        ts.all_segments_total,
+        ts.pages_in_use_total,
+        ts.pages_in_full_total,
+        ts.pages_in_bin_total,
+        ts.pages_with_xthread_pending_total,
+        ts.blocks_in_use_total,
+        ts.blocks_capacity_total,
+        tag,
+        gs.active_threads,
+        gs.abandoned_segments,
+        gs.pending_xthread_free,
+        gs.arena_count,
+        @as(f64, @floatFromInt(gs.arenas_total_bytes)) / MB,
+        @as(f64, @floatFromInt(gs.arenas_used_bytes)) / MB,
+        @as(f64, @floatFromInt(gs.arenas_committed_bytes)) / MB,
+        @as(f64, @floatFromInt(gs.arenas_dirty_bytes)) / MB,
+        @as(f64, @floatFromInt(gs.arenas_purge_pending_bytes)) / MB,
+    });
+}
 
 /// Aligned allocation (internal)
 fn alignedAlloc(alignment: usize, size: usize) ?*anyopaque {
