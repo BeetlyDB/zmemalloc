@@ -1109,10 +1109,10 @@ pub const GlobalStats = struct {
 };
 
 fn queueLen(q: *const segment_mod.SegmentQueue) usize {
-    var n: usize = 0;
-    var cur = q.head;
-    while (cur) |s| : (cur = s.next) n += 1;
-    return n;
+    // SegmentQueue is `DoublyLinkedListType(Segment, .next, .prev)`, which
+    // maintains its own `count: u32` field. The struct has no `head`, only
+    // `tail`, and iterates via field_back = .next.
+    return @as(usize, q.count);
 }
 
 /// Collect per-thread stats for the calling thread. Returns all zero if the
