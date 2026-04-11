@@ -849,8 +849,16 @@ pub const SegmentsTLD = struct {
     /// Each segment is 32MB, so 4 segments = 128MB of cached memory.
     const SEGMENT_CACHE_THRESHOLD: usize = 4;
 
-    /// How many empty segments to keep cached per queue type.
-    /// Keep minimal cache to reduce RSS while still avoiding mmap/munmap thrashing.
+    /// How many empty segments to keep cached per thread (across all kinds).
+    /// Each segment is 32 MiB, so with N threads the worst-case thread-local
+    /// cache is N * MAX * 32 MiB. The arena layer already does its own
+    /// reuse caching via PURGE_DELAY_MS (blocks freed back to the arena stay
+    /// committed for 10 ms and are reclaimed without re-mmap if a new
+    /// allocation comes in), so a large thread-local cache is largely
+    /// redundant and just bloats RSS in multi-threaded workloads.
+    ///
+    /// Keeping this at 1 trades a few extra purge cycles per thread for a
+    /// dramatic RSS reduction (was 3 * N * 32 MiB, now 1 * N * 32 MiB).
     const EMPTY_SEGMENT_CACHE_MAX: usize = 1;
 
     /// Purge delay in milliseconds (mimalloc style)
@@ -866,16 +874,11 @@ pub const SegmentsTLD = struct {
             if (force) {
                 // Only free segment if explicitly forced
                 self.freeSegment(segment, true);
-            } else if (self.empty_segment_count >= EMPTY_SEGMENT_CACHE_MAX * 3) {
-                // Cache is at its limit (3 empty segments = ~96 MiB per
-                // thread). Free this one immediately and let the arena
-                // purge it after PURGE_DELAY_MS.
-                //
-                // The previous condition was `>= MAX*3 AND count > THRESHOLD`
-                // which never freed anything when total segment count was
-                // small, allowing the cache to grow unboundedly in
-                // cross-thread workloads. Dropping the AND clause caps the
-                // cache at MAX*3 always.
+            } else if (self.empty_segment_count >= EMPTY_SEGMENT_CACHE_MAX) {
+                // Cache is at its limit. Free this segment immediately —
+                // the arena will keep the backing blocks around for
+                // PURGE_DELAY_MS, so a subsequent alloc in this thread
+                // reclaims them without a new mmap.
                 self.freeSegment(segment, true);
             } else {
                 // Cache empty segment for reuse
