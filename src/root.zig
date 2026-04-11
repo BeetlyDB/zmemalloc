@@ -1186,12 +1186,23 @@ pub fn getGlobalStats() GlobalStats {
 /// distinguished. Safe to call from any thread; per-thread section only
 /// reflects the caller's TLD.
 pub fn dumpStats(tag: []const u8) void {
+    // Sanity probe: force a round-trip through the allocator so we can
+    // tell whether this module instance is actually wired up. If all
+    // counters are zero here, either nothing has been allocated through
+    const probe = malloc(8);
+    if (probe) |p| freeImpl(p);
+
     const ts = getThreadStats();
     const gs = getGlobalStats();
     const MB: f64 = 1024.0 * 1024.0;
 
+    // Expose the addresses of the module-global state so it's easy to
+    // tell at a glance if two calls from "the same" program are hitting
+    // different linker copies of this module.
+    const instance_id = @intFromPtr(&active_thread_count);
+
     std.debug.print(
-        \\[zmemalloc:{s}] ===== thread tid=0x{x} =====
+        \\[zmemalloc:{s}] ===== thread tid=0x{x} instance=0x{x} =====
         \\  segments     count={d} peak={d} size={d:.1}MB peak_size={d:.1}MB
         \\  empty_cache  {d}  reclaims={d}
         \\  free_queues  small={d} medium={d} large={d}
@@ -1206,6 +1217,7 @@ pub fn dumpStats(tag: []const u8) void {
     , .{
         tag,
         ts.thread_id,
+        instance_id,
         ts.segments_count,
         ts.segments_peak_count,
         @as(f64, @floatFromInt(ts.segments_current_size)) / MB,
