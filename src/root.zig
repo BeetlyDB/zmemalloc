@@ -1092,6 +1092,19 @@ pub const ThreadStats = struct {
     pages_with_xthread_pending_total: usize,
     blocks_in_use_total: usize,
     blocks_capacity_total: usize,
+
+    // Fragmentation diagnostics:
+    // `pages_stuck_in_full`: pages with `is_in_full()` but `hasFree()` — these
+    //   should have been reactivated by `reclaimFullPages`. Nonzero means
+    //   reclaim isn't running often enough (or not at all) for this thread.
+    // `pages_empty_leaked`: pages with `used == 0` still marked in use — these
+    //   should have been freed back to the segment.
+    // `pages_under_quarter` / `pages_over_three_quarters`: utilization
+    //   histogram buckets to show if pages are converging to low utilization.
+    pages_stuck_in_full: usize,
+    pages_empty_leaked: usize,
+    pages_under_quarter: usize,
+    pages_over_three_quarters: usize,
 };
 
 /// Global allocator statistics collected by `dumpStats`.
@@ -1150,8 +1163,22 @@ pub fn getThreadStats() ThreadStats {
             if (pg.xthread_free.load(.monotonic) != null) {
                 s.pages_with_xthread_pending_total += 1;
             }
-            s.blocks_in_use_total += @as(usize, pg.used);
-            s.blocks_capacity_total += @as(usize, pg.capacity);
+            const used = @as(usize, pg.used);
+            const pcap = @as(usize, pg.capacity);
+            s.blocks_in_use_total += used;
+            s.blocks_capacity_total += pcap;
+
+            // Fragmentation buckets
+            if (pg.is_in_full() and pg.hasFree()) {
+                s.pages_stuck_in_full += 1;
+            }
+            if (used == 0 and pcap > 0) {
+                s.pages_empty_leaked += 1;
+            }
+            if (pcap > 0) {
+                if (used * 4 < pcap) s.pages_under_quarter += 1;
+                if (used * 4 > pcap * 3) s.pages_over_three_quarters += 1;
+            }
         }
         cur = next;
     }
@@ -1201,6 +1228,10 @@ pub fn dumpStats(tag: []const u8) void {
     // different linker copies of this module.
     const instance_id = @intFromPtr(&active_thread_count);
 
+    const util_pct: f64 = if (ts.blocks_capacity_total == 0) 0.0 else
+        100.0 * @as(f64, @floatFromInt(ts.blocks_in_use_total)) /
+            @as(f64, @floatFromInt(ts.blocks_capacity_total));
+
     std.debug.print(
         \\[zmemalloc:{s}] ===== thread tid=0x{x} instance=0x{x} =====
         \\  segments     count={d} peak={d} size={d:.1}MB peak_size={d:.1}MB
@@ -1208,7 +1239,8 @@ pub fn dumpStats(tag: []const u8) void {
         \\  free_queues  small={d} medium={d} large={d}
         \\  all_segs     {d}
         \\  pages        in_use={d} in_full={d} in_bin={d} xthread_pending={d}
-        \\  blocks       used={d}/{d}
+        \\  frag         stuck_full={d} empty_leaked={d} under_25%={d} over_75%={d}
+        \\  blocks       used={d}/{d} ({d:.1}%)
         \\[zmemalloc:{s}] ===== global =====
         \\  threads      active={d}  abandoned_segs={d}  pending_xthread_free={d}
         \\  arenas       count={d}
@@ -1232,8 +1264,13 @@ pub fn dumpStats(tag: []const u8) void {
         ts.pages_in_full_total,
         ts.pages_in_bin_total,
         ts.pages_with_xthread_pending_total,
+        ts.pages_stuck_in_full,
+        ts.pages_empty_leaked,
+        ts.pages_under_quarter,
+        ts.pages_over_three_quarters,
         ts.blocks_in_use_total,
         ts.blocks_capacity_total,
+        util_pct,
         tag,
         gs.active_threads,
         gs.abandoned_segments,
