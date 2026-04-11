@@ -1241,10 +1241,6 @@ pub fn dumpStats(tag: []const u8) void {
         \\  pages        in_use={d} in_full={d} in_bin={d} xthread_pending={d}
         \\  frag         stuck_full={d} empty_leaked={d} under_25%={d} over_75%={d}
         \\  blocks       used={d}/{d} ({d:.1}%)
-        \\[zmemalloc:{s}] ===== global =====
-        \\  threads      active={d}  abandoned_segs={d}  pending_xthread_free={d}
-        \\  arenas       count={d}
-        \\  arena_bytes  total={d:.1}MB used={d:.1}MB committed={d:.1}MB dirty={d:.1}MB purge_pending={d:.1}MB
         \\
     , .{
         tag,
@@ -1271,6 +1267,15 @@ pub fn dumpStats(tag: []const u8) void {
         ts.blocks_in_use_total,
         ts.blocks_capacity_total,
         util_pct,
+    });
+
+    std.debug.print(
+        \\[zmemalloc:{s}] ===== global =====
+        \\  threads      active={d}  abandoned_segs={d}  pending_xthread_free={d}
+        \\  arenas       count={d}
+        \\  arena_bytes  total={d:.1}MB used={d:.1}MB committed={d:.1}MB dirty={d:.1}MB purge_pending={d:.1}MB
+        \\
+    , .{
         tag,
         gs.active_threads,
         gs.abandoned_segments,
