@@ -80,6 +80,27 @@ const SegmentAbandonedQueue = segment_mod.SegmentAbandonedQueue;
 /// Max segments to reclaim from abandoned queue per allocation attempt
 const ABANDON_RECLAIM_LIMIT: usize = 16;
 
+/// Eager reclaim limit on the slow allocation path. We bias toward taking
+/// ONE segment at a time so the abandonment policy actually balances memory
+/// across threads instead of a single thread hoarding the entire queue.
+const ABANDON_EAGER_RECLAIM: usize = 1;
+
+/// Per-thread minimum working set below which we never abandon. A thread
+/// with 1 segment has nothing to share — abandoning it would just force a
+/// fresh arena allocation on the very next slow-path call.
+const ABANDON_MIN_SEGMENTS: usize = 2;
+
+/// Max segments abandoned per maintenance call. Keeps maintenance latency
+/// bounded and avoids one thread dumping its entire working set in a single
+/// tick.
+const ABANDON_MAX_PER_CALL: usize = 2;
+
+/// Block utilization threshold (numerator / denominator) below which a
+/// segment becomes an abandonment candidate. 1/2 means "< 50% of blocks in
+/// use" — matches mimalloc's reclamation heuristic.
+const ABANDON_UTIL_NUM: usize = 1;
+const ABANDON_UTIL_DEN: usize = 2;
+
 /// Trigger full page scan when this many cross-thread frees are pending
 /// Higher = less scanning overhead, but more memory retention
 const XTHREAD_COLLECT_THRESHOLD: usize = 1024;
@@ -406,10 +427,22 @@ inline fn mallocGeneric(heap: *Heap, size: usize, zero: bool) ?[*]u8 {
         }
     }
 
+    // Eager reclaim: before creating a fresh segment from the arena, try
+    // to adopt one from the abandoned queue. This is the consumer side of
+    // the abandonment policy — it biases allocation toward reusing memory
+    // that another thread released instead of growing the arena footprint.
+    // Bounded to `ABANDON_EAGER_RECLAIM` per call so no single thread can
+    // drain the queue; balance is the goal.
+    if (global_subproc.abandoned_count.load(.monotonic) > 0) {
+        @branchHint(.unlikely);
+        _ = reclaimAbandoned(ABANDON_EAGER_RECLAIM);
+    }
+
     // Try to get a page, reclaim abandoned segments if needed
     var page = t.segments.allocPage(block_size);
     if (page == null) {
-        // Try to reclaim abandoned segments from other threads
+        // Last-ditch: drain as many abandoned segments as configured,
+        // then retry.
         if (global_subproc.abandoned_count.load(.monotonic) > 0) {
             _ = reclaimAbandoned(ABANDON_RECLAIM_LIMIT);
             page = t.segments.allocPage(block_size);
@@ -581,6 +614,151 @@ noinline fn reclaimFullPages(t: *TLD, heap: *Heap) usize {
         segment = next;
     }
     return reclaimed;
+}
+
+// =============================================================================
+// Segment Abandonment Policy
+// =============================================================================
+//
+// Without an abandonment policy, each thread hoards its own segments and
+// RSS grows unboundedly in asymmetric workloads: a producer thread allocates
+// many pages at 10-20% utilization, the consumer frees blocks that land in
+// xthread_free, but the producer never releases the underlying segments
+// because its `pages_free_direct` and bin queues keep the pages pinned.
+//
+// The policy here mirrors mimalloc: when a thread's segment drops below a
+// block-utilization threshold and the thread still has other segments of
+// the same kind to fall back on, we detach the underutilized segment from
+// this thread's bookkeeping and push it onto the global abandoned queue.
+// Other threads reclaim it via `reclaimAbandoned` on their slow path, so
+// the physical memory is shared across the process instead of being pinned
+// to one thread.
+
+/// Count segments of a given kind in this thread's `all_segments` list.
+/// O(N) in segment count but N is typically small (< 16).
+inline fn countSegmentsOfKind(t: *TLD, kind: Segment.PageKind) usize {
+    var c: usize = 0;
+    var it = t.segments.all_segments.tail;
+    while (it) |seg| {
+        if (seg.page_kind == kind) c += 1;
+        it = seg.all_next;
+    }
+    return c;
+}
+
+/// Detach a single segment from this thread's bookkeeping and push it onto
+/// the global abandoned queue. The caller must ensure the segment is a
+/// valid abandonment candidate (small/medium, not empty, owned by this
+/// thread, and not the last of its kind).
+///
+/// After this call the segment's memory is untouched but no longer
+/// reachable via any of this thread's heap bin queues, direct pointers,
+/// free segment queues, or `all_segments` list. Other threads can pick it
+/// up via `reclaimAbandoned`.
+noinline fn abandonOneSegment(t: *TLD, heap: *Heap, seg: *Segment) void {
+    // Detach every in-use page from this heap's bookkeeping. After
+    // abandonment the pages (and their free lists) are opaque to us — a
+    // reclaimer may reuse them to host new allocations.
+    const capacity = seg.capacity;
+    var i: usize = 0;
+    while (i < capacity) : (i += 1) {
+        const pg = &seg.pages[i];
+        if (!pg.is_segment_in_use()) continue;
+
+        // Remove from heap bin queue (clears next/prev + in_bin flag).
+        if (pg.is_in_bin()) {
+            const bin = page_mod.binFromSize(pg.block_size);
+            pg.pageRemoveFromBin(heap, bin);
+        }
+        // Drop any direct page pointers referencing this page.
+        clearDirectPointersForPage(heap, pg);
+        // Reset in_full: a reclaimer should see `hasFree()` truthfully so
+        // it can put the page back into its own bin queue if desired.
+        pg.set_in_full(false);
+        // Defensive: stale next/prev could outlive removal if a bin queue
+        // operation was skipped (e.g. !is_in_bin() but pointers leftover).
+        pg.next = null;
+        pg.prev = null;
+    }
+
+    // Remove from per-thread segment bookkeeping.
+    t.segments.removeFromFreeQueue(seg);
+    t.segments.all_segments.remove(seg);
+
+    // Account: this memory no longer counts against the thread's working
+    // set. `trackSize` uses saturating subtract so it can't underflow.
+    t.segments.trackSize(-@as(isize, @intCast(seg.segment_size)));
+
+    // Publish abandonment atomically, then push onto the global queue
+    // under the abandoned_os_lock. Order matters: readers that observe
+    // `thread_id == 0` via the free path use `pushFreeBlock` directly, so
+    // they MUST see a fully-detached segment — the lock's release-acquire
+    // semantics propagate the store to thread_id.
+    seg.markAbandoned();
+    seg.abandoned += 1;
+
+    global_subproc.abandoned_os_lock.lock();
+    global_subproc.abandoned_os_list.push(seg);
+    _ = global_subproc.abandoned_os_list_count.fetchAdd(1, .monotonic);
+    _ = global_subproc.abandoned_count.fetchAdd(1, .monotonic);
+    global_subproc.abandoned_os_lock.unlock();
+}
+
+/// Scan this thread's segments and abandon up to `ABANDON_MAX_PER_CALL` of
+/// them if they are below the utilization threshold. Returns number of
+/// segments abandoned.
+noinline fn maybeAbandonSegments(t: *TLD, heap: *Heap) usize {
+    // Fast exit: nothing to share if we're at or below the minimum.
+    if (t.segments.all_segments.count < ABANDON_MIN_SEGMENTS) return 0;
+
+    var abandoned: usize = 0;
+    var seg_it = t.segments.all_segments.tail;
+    while (seg_it) |seg| {
+        // Capture next link BEFORE potentially removing `seg` from the list.
+        const next = seg.all_next;
+        seg_it = next;
+
+        if (abandoned >= ABANDON_MAX_PER_CALL) break;
+
+        // Only consider small/medium: large segments hold 1 page each (so
+        // utilization is binary — either the large alloc is live or the
+        // segment goes through the empty cache), and huge segments are
+        // unique-sized and not shareable.
+        if (seg.page_kind != .small and seg.page_kind != .medium) continue;
+
+        // Fully-empty segments belong to the empty-segment cache path, not
+        // the abandonment queue — abandoning them would prevent the cache
+        // from ever releasing backing arena memory.
+        if (seg.used == 0) continue;
+
+        // Compute block utilization across all in-use pages.
+        var blocks_used: usize = 0;
+        var blocks_cap: usize = 0;
+        const cap = seg.capacity;
+        var i: usize = 0;
+        while (i < cap) : (i += 1) {
+            const pg = &seg.pages[i];
+            if (!pg.is_segment_in_use()) continue;
+            blocks_used += @as(usize, pg.used);
+            blocks_cap += @as(usize, pg.capacity);
+        }
+        if (blocks_cap == 0) continue;
+
+        // Utilization check: used/cap < NUM/DEN  <=>  used*DEN < cap*NUM
+        if (blocks_used * ABANDON_UTIL_DEN >= blocks_cap * ABANDON_UTIL_NUM) continue;
+
+        // Keep at least one segment of each kind so the thread can still
+        // service its own allocations without a round-trip through the
+        // abandoned queue.
+        if (countSegmentsOfKind(t, seg.page_kind) <= 1) continue;
+
+        // Global minimum working set.
+        if (t.segments.all_segments.count <= ABANDON_MIN_SEGMENTS) break;
+
+        abandonOneSegment(t, heap, seg);
+        abandoned += 1;
+    }
+    return abandoned;
 }
 
 // =============================================================================
@@ -768,6 +946,16 @@ noinline fn doPeriodicMaintenance(heap: *Heap) void {
             _ = t.segments.collectAllXthreadFree();
             _ = reclaimFullPages(t, heap);
         }
+    }
+    // Abandonment policy: once xthread frees are drained and empty pages
+    // are reclaimed, check whether any segments have dropped below the
+    // utilization threshold and can be handed off to other threads. This
+    // is how we match mimalloc's RSS profile on asymmetric producer-
+    // consumer workloads — a thread that starts hoarding 7+ segments at
+    // ~10% utilization will abandon the worst ones here, and peers will
+    // pick them up via `reclaimAbandoned` on their slow path.
+    if (heap.tld) |t| {
+        _ = maybeAbandonSegments(t, heap);
     }
     // Always drive arena purges (cheap — time-gated via purge_expire).
     // This is the only place the purge runs for workloads that never hit
