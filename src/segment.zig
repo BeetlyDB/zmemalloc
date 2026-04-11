@@ -793,10 +793,14 @@ pub const SegmentsTLD = struct {
             huge_registry.unregister(segment);
         }
 
-        // Update empty segment counter
-        if (segment.used == 0) {
-            self.empty_segment_count -|= 1;
-        }
+        // NOTE: `empty_segment_count` is NOT decremented here. It is
+        // maintained by the explicit callers that know whether this
+        // segment was previously accounted for (see `tryAllocInQueue`,
+        // `reduceMemory`, and the purge path in `collect`). Decrementing
+        // unconditionally would underflow the counter when freeing a
+        // segment that was never cached as empty — e.g. the forced path
+        // in `freePage` when the cache is already full — which in turn
+        // disables the cache and causes spurious arena round-trips.
 
         self.removeFromFreeQueue(segment);
 
@@ -862,15 +866,16 @@ pub const SegmentsTLD = struct {
             if (force) {
                 // Only free segment if explicitly forced
                 self.freeSegment(segment, true);
-            } else if (self.empty_segment_count >= EMPTY_SEGMENT_CACHE_MAX or self.count > SEGMENT_CACHE_THRESHOLD) {
-                // Either cache is already at/above its limit, or we've hit
-                // the total segment threshold. Free immediately to return
-                // memory to the arena (which will purge after PURGE_DELAY_MS).
+            } else if (self.empty_segment_count >= EMPTY_SEGMENT_CACHE_MAX * 3) {
+                // Cache is at its limit (3 empty segments = ~96 MiB per
+                // thread). Free this one immediately and let the arena
+                // purge it after PURGE_DELAY_MS.
                 //
-                // Previously this used `EMPTY_SEGMENT_CACHE_MAX * 3` AND
-                // required `count > SEGMENT_CACHE_THRESHOLD`, which allowed
-                // up to 3 empty segments (96 MiB) to sit cached forever in
-                // cross-thread workloads where producer pages drain slowly.
+                // The previous condition was `>= MAX*3 AND count > THRESHOLD`
+                // which never freed anything when total segment count was
+                // small, allowing the cache to grow unboundedly in
+                // cross-thread workloads. Dropping the AND clause caps the
+                // cache at MAX*3 always.
                 self.freeSegment(segment, true);
             } else {
                 // Cache empty segment for reuse
@@ -896,8 +901,19 @@ pub const SegmentsTLD = struct {
             }
             @prefetch(seg, .{ .cache = .data, .locality = 3, .rw = .read });
             if (seg.hasFree()) {
+                // Snapshot state BEFORE findFreePage mutates `used`.
+                // A segment in the free queue with `used == 0` was cached
+                // as empty by `freePage` (which incremented the counter).
+                // Reusing it here means it's no longer empty, so the
+                // counter must drop. Without this, the counter drifts
+                // upward unboundedly across reuse, permanently disabling
+                // caching in `freePage` once it exceeds the threshold.
+                const was_cached_empty = seg.used == 0;
                 if (seg.findFreePage()) |pg| {
                     @setEvalBranchQuota(100_000);
+                    if (was_cached_empty) {
+                        self.empty_segment_count -|= 1;
+                    }
                     if (!seg.hasFree()) {
                         self.removeFromFreeQueue(seg);
                     }
@@ -1130,6 +1146,11 @@ pub const SegmentsTLD = struct {
 
         // Free empty segments (outside of iteration to avoid queue corruption)
         for (segments_to_free[0..free_count]) |seg| {
+            // These segments were in the free queue with used==0, i.e.
+            // they were counted in `empty_segment_count` when cached.
+            // Decrement explicitly now that `freeSegment` no longer
+            // manages the counter.
+            self.empty_segment_count -|= 1;
             self.freeSegment(seg, true);
             collected += 1;
         }
@@ -1193,7 +1214,12 @@ pub const SegmentsTLD = struct {
                 const seg = q.pop() orelse break;
                 seg.in_free_queue = false;
                 if (seg.used == 0) {
-                    // Note: freeSegment already decrements empty_segment_count
+                    // A segment in the free queue with used==0 was
+                    // previously accounted in empty_segment_count via
+                    // `freePage`'s cache path. Decrement explicitly now
+                    // that we're about to free it — `freeSegment` no
+                    // longer touches the counter.
+                    self.empty_segment_count -|= 1;
                     self.freeSegment(seg, true);
                     freed += 1;
                 } else {

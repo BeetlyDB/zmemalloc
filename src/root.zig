@@ -367,6 +367,13 @@ inline fn setDirectPointerForBlockSize(heap: *Heap, page: *Page) void {
 inline fn mallocGeneric(heap: *Heap, size: usize, zero: bool) ?[*]u8 {
     const t = heap.tld orelse return null;
 
+    // Drive deferred arena decommits on the slow path. The call is
+    // time-gated via `purge_expire`, so it's just an atomic load + branch
+    // when there's nothing to do. Without this, segments freed from the
+    // slow path stay committed indefinitely until periodic maintenance
+    // catches them.
+    arena_mod.globalArenas().tryPurge(false);
+
     // Round up to bin's block size - this allows page reuse across similar sizes
     const bin = page_mod.binFromSize(size);
     // For huge allocations (> LARGE_OBJ_SIZE_MAX), use the requested size directly
