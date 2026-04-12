@@ -1233,11 +1233,15 @@ pub fn reclaimAbandoned(max_count: usize) usize {
             _ = global_subproc.abandoned_os_list_count.fetchSub(1, .monotonic);
             _ = global_subproc.abandoned_count.fetchSub(1, .monotonic);
 
-            // Add to our segment lists
+            // Add to our segment lists and account for the memory.
+            // trackSize keeps count/current_size/peak_* in sync so that
+            // the abandonment policy's ABANDON_MIN_SEGMENTS check sees the
+            // full picture (not just natively-allocated segments).
             seg.?.was_reclaimed = true;
             seg.?.heap.store(&heap_mod.heap_main, .release); // Update heap pointer to new owner
             tld.segments.all_segments.push(seg.?);
             tld.segments.insertInFreeQueue(seg.?);
+            tld.segments.trackSize(@intCast(seg.?.segment_size));
             tld.segments.reclaim_count += 1;
 
             reclaimed += 1;

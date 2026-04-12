@@ -132,7 +132,13 @@ pub inline fn prim_decommit(mem: []align(mem_config_static.page_size) u8, needs_
     if (mem.len == 0) return;
 
     needs_recommit.* = false;
-    try posix.madvise(mem.ptr, mem.len, posix.MADV.FREE);
+    // MADV_DONTNEED immediately releases physical pages and drops RSS.
+    // MADV_FREE (previously used) is lazy — the kernel keeps pages in RSS
+    // until memory pressure forces reclamation, inflating RSS by ~2x
+    // compared to mimalloc which uses DONTNEED. The PURGE_DELAY_MS window
+    // already provides a grace period for rapid reuse, so eager release
+    // after that delay is the right trade-off.
+    try posix.madvise(mem.ptr, mem.len, posix.MADV.DONTNEED);
 }
 
 pub inline fn prim_protect(mem: []align(mem_config_static.page_size) u8, do_protect: bool) !void {
