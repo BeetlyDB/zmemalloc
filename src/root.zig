@@ -689,6 +689,13 @@ noinline fn abandonOneSegment(t: *TLD, heap: *Heap, seg: *Segment) void {
     // set. `trackSize` uses saturating subtract so it can't underflow.
     t.segments.trackSize(-@as(isize, @intCast(seg.segment_size)));
 
+    // Immediately purge (MADV_DONTNEED) all unused pages within the
+    // segment so their physical memory is returned to the OS right now.
+    // Without this, abandoned segments sit in the queue with full RSS
+    // footprint until someone reclaims them — which may never happen if
+    // all threads are at steady state.
+    _ = seg.purgeUnusedPages();
+
     // Publish abandonment atomically, then push onto the global queue
     // under the abandoned_os_lock. Order matters: readers that observe
     // `thread_id == 0` via the free path use `pushFreeBlock` directly, so
@@ -957,6 +964,11 @@ noinline fn doPeriodicMaintenance(heap: *Heap) void {
     if (heap.tld) |t| {
         _ = maybeAbandonSegments(t, heap);
     }
+    // Scrub the abandoned queue: purge unused pages in partially-used
+    // abandoned segments and free fully-empty ones back to the arena.
+    // Without this, abandoned segments that are never reclaimed by another
+    // thread sit in the queue with committed physical memory indefinitely.
+    purgeAbandonedSegments();
     // Always drive arena purges (cheap — time-gated via purge_expire).
     // This is the only place the purge runs for workloads that never hit
     // the slow allocation path.
@@ -1252,6 +1264,92 @@ pub fn reclaimAbandoned(max_count: usize) usize {
 
     global_subproc.abandoned_os_lock.unlock();
     return reclaimed;
+}
+
+/// Walk the global abandoned queue and:
+/// 1. For partially-used segments: purge (MADV_DONTNEED) unused pages so
+///    their physical memory is returned to the OS while the segment waits
+///    in the queue.
+/// 2. For fully-empty segments (all pages freed by other threads via
+///    freeImpl's abandoned path): free them back to the arena so the
+///    backing memory can be fully decommitted.
+///
+/// This is critical for steady-state workloads where no thread is actively
+/// in the slow path — without it, abandoned segments sit in the queue with
+/// committed RSS indefinitely.
+noinline fn purgeAbandonedSegments() void {
+    const count = global_subproc.abandoned_os_list_count.load(.monotonic);
+    if (count == 0) return;
+
+    // Non-blocking trylock — if another thread is already scrubbing, skip.
+    if (!global_subproc.abandoned_os_visit_lock.trylock()) return;
+    defer global_subproc.abandoned_os_visit_lock.unlock();
+
+    global_subproc.abandoned_os_lock.lock();
+
+    // Collect segments to free (can't modify queue while iterating in some
+    // degenerate cases, so buffer removals).
+    var to_free: [32]*Segment = undefined;
+    var free_count: usize = 0;
+
+    var seg = global_subproc.abandoned_os_list.head;
+    while (seg) |s| {
+        const next = s.abandoned_os_next;
+
+        // Check if all pages in this abandoned segment are now unused.
+        // (Other threads free blocks via `freeImpl` which decrements
+        // `pg.used`; when all blocks on a page are freed, `used` is 0.)
+        var all_empty = true;
+        const cap = s.capacity;
+        var i: usize = 0;
+        while (i < cap) : (i += 1) {
+            const pg = &s.pages[i];
+            if (pg.is_segment_in_use() and pg.used > 0) {
+                all_empty = false;
+                break;
+            }
+        }
+
+        if (all_empty and free_count < to_free.len) {
+            to_free[free_count] = s;
+            free_count += 1;
+        } else {
+            // Still has live blocks — purge unused pages to drop RSS.
+            _ = s.purgeUnusedPages();
+        }
+
+        seg = next;
+    }
+
+    // Free fully-empty segments back to the arena.
+    for (to_free[0..free_count]) |s| {
+        global_subproc.abandoned_os_list.remove(s);
+        _ = global_subproc.abandoned_os_list_count.fetchSub(1, .monotonic);
+        _ = global_subproc.abandoned_count.fetchSub(1, .monotonic);
+
+        // Clear all page state so the segment can be recycled cleanly.
+        const cap = s.capacity;
+        var i: usize = 0;
+        while (i < cap) : (i += 1) {
+            const pg = &s.pages[i];
+            if (pg.is_segment_in_use()) {
+                s.pageClear(pg);
+                s.used -|= 1;
+            }
+        }
+
+        // Return memory to arena (schedules decommit via purge delay).
+        if (s.memid.memkind == .MEM_ARENA) {
+            const arena_info = s.memid.arena_info();
+            const arenas = arena_mod.globalArenas();
+            if (arenas.get(@intCast(arena_info.id))) |arena| {
+                const block_count = arena_mod.blockCountForSize(s.segment_size);
+                arena.free(arena_info.block_index, block_count, s.memid.flags.initially_committed);
+            }
+        }
+    }
+
+    global_subproc.abandoned_os_lock.unlock();
 }
 
 /// Get count of abandoned segments waiting to be reclaimed
